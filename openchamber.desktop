@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Open Chamber
+Comment=Webview leve para Open Chamber
+Exec=/home/maiteuxzanela/openchamber-app/run.sh
+Path=/home/maiteuxzanela/openchamber-app
+Icon=utilities-terminal
+Terminal=false
+Categories=Development;Utility;
