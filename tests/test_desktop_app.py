@@ -1,11 +1,13 @@
 import os
 import base64
 import inspect
+import shutil
 import subprocess
 import sys
 import threading
 import time
 import typing
+import webbrowser
 from pathlib import Path
 import pytest
 
@@ -29,6 +31,8 @@ import webview
 
 from app import (
     is_external_url,
+    open_external,
+    browser_spawn_suppressed,
     resolve_openchamber_bin,
     resolve_debug_mode,
     preserve_default_context_menu,
@@ -40,6 +44,7 @@ from app import (
     get_desktop_handlers_js,
     setup_window_handlers,
 )
+import app as app_module
 
 
 # =====================================================================
@@ -484,11 +489,251 @@ def test_desktop_api_get_clipboard_image_base64_timeout_returns_none():
     assert result is None
 
 
-def test_desktop_api_open_external_link_fail_soft_on_empty_url():
-    """Valida que open_external_link lida suavemente com URL vazia ou inválida sem exceção."""
+# =====================================================================
+# 6.1 open_external() — guardas fail-fast de abertura de navegador
+#     (task_mv82vmnr_0001_c6bhij)
+# =====================================================================
+
+@pytest.fixture
+def browser_spawn_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Sonda REAL (zero mocks) contra spawn de navegador nos testes.
+
+    Redireciona os dois caminhos reais de abertura de URL para scripts
+    sentinelas dentro de ``tmp_path``:
+
+    * ``$BROWSER`` — variável consultada pelo módulo ``webbrowser`` do Python
+      em ``webbrowser.open()``;
+    * ``PATH`` — shims ``xdg-open`` e navegadores comuns, cobrindo o fallback
+      ``subprocess.run(['xdg-open', ...])``.
+
+    Os sentinelas apenas gravam a URL num arquivo de marcação e encerram —
+    nenhum navegador real é acionado em nenhuma circunstância. Se uma guarda
+    de ``open_external`` falhar, o arquivo aparece e o teste falha; se a
+    própria sonda estiver quebrada,
+    ``test_browser_spawn_probe_detects_real_webbrowser_call`` falha primeiro.
+    """
+    marker = tmp_path / "browser.spawned"
+    shim_dir = tmp_path / "bin"
+    shim_dir.mkdir()
+    sentinel = shim_dir / "spawn-sentinel"
+    sentinel.write_text(
+        "#!/bin/sh\n"
+        f'printf \'%s\\n\' "$*" >> "{marker}"\n'
+    )
+    sentinel.chmod(0o755)
+    for name in (
+        "xdg-open", "firefox", "google-chrome", "chromium", "chromium-browser",
+        "www-browser", "x-www-browser", "lynx", "w3m", "links",
+    ):
+        link = shim_dir / name
+        if not link.exists():
+            link.symlink_to(sentinel)
+    monkeypatch.setenv("BROWSER", str(sentinel))
+    monkeypatch.setenv("PATH", f"{shim_dir}{os.pathsep}{os.environ['PATH']}")
+    return marker
+
+
+def _wait_for_spawn_marker(marker: Path, timeout: float = 5.0) -> bool:
+    """Aguarda com polling real a gravação da marcação da sonda (spawn é async)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if marker.exists():
+            return True
+        time.sleep(0.05)
+    return marker.exists()
+
+
+def _assert_no_browser_spawn(marker: Path, context: str, settle: float = 0.4) -> None:
+    """Exige ausência de spawn, concedendo ao SO uma janela real para gravar.
+
+    O spawn via ``webbrowser``/``Popen`` é assíncrono: sem a janela de
+    ``settle`` um teste poderia passar falso-positivamente antes da sonda
+    gravar a marcação.
+    """
+    if settle:
+        time.sleep(settle)
+    assert not marker.exists(), (
+        f"{context}: spawn de navegador detectado pela sonda -> "
+        f"{marker.read_text().strip()!r}"
+    )
+
+
+def test_browser_spawn_probe_detects_real_webbrowser_call(browser_spawn_probe: Path):
+    """Autochecagem da sonda: um ``webbrowser.open`` real DEVE ser capturado.
+
+    Garante que os asserts ``not marker.exists()`` dos demais testes não são
+    falsos-positivos — o mecanismo de detecção é exercitado de fato, contra o
+    sentinel e nunca contra um navegador real.
+    """
+    webbrowser.open("https://example.com/probe-self-check")
+    assert _wait_for_spawn_marker(browser_spawn_probe), (
+        "sonda não capturou webbrowser.open: os testes de supressão seriam "
+        "falsos-positivos"
+    )
+    assert "https://example.com/probe-self-check" in browser_spawn_probe.read_text()
+
+
+def test_desktop_api_open_external_link_fail_soft_on_empty_url(browser_spawn_probe):
+    """Valida que open_external_link descarta URLs vazias, inválidas, de esquema
+    desconhecido ou local sem levantar erro e SEM tocar no sistema operacional.
+
+    Cobertura: "", "javascript:void(0)", "http://localhost:3000" e demais
+    categorias rejeitadas por ``is_external_url``. A sonda real
+    ``browser_spawn_probe`` falha o teste se qualquer spawn (webbrowser ou
+    xdg-open) chegar ao SO.
+    """
     api = DesktopAPI()
-    api.open_external_link("")
-    api.open_external_link("javascript:void(0)")
+    rejected_urls = [
+        "",                                  # vazio
+        "   ",                               # só espaços (não-externo)
+        "javascript:void(0)",                # esquema desconhecido/ataque
+        "file:///etc/passwd",                # esquema de arquivo local
+        "data:text/plain;base64,SGVsbG8=",   # esquema de dados
+        "about:blank",                       # esquema interno do browser
+        "ftp://ftp.example.com/file.zip",    # esquema não suportado
+        "not-a-valid-url-format",            # lixo sem esquema
+        "http://localhost:3000",             # host local
+        "http://127.0.0.1:8080/session/1",   # host local
+        "http://0.0.0.0:3000",               # bind local
+        "http://[::1]:3000",                 # loopback IPv6
+    ]
+    for url in rejected_urls:
+        api.open_external_link(url)          # não deve levantar exceção
+        assert not browser_spawn_probe.exists(), (
+            f"open_external_link({url!r}) disparou spawn de navegador no SO"
+        )
+    _assert_no_browser_spawn(browser_spawn_probe, "open_external_link")
+
+
+def test_open_external_discards_non_external_urls_without_touching_os(browser_spawn_probe):
+    """Guarda 1 de open_external: validação preliminar estrita — URL vazia ou
+    não-externa retorna imediatamente, sem ``webbrowser.open`` nem ``xdg-open``."""
+    rejected_urls = [
+        "",
+        None,  # type: ignore[arg-type]  # robustez: falsy nulo não pode explodir
+        "javascript:void(0)",
+        "http://localhost:3000",
+        "https://localhost/admin",
+        "http://127.0.0.1:9090",
+        "file:///etc/hosts",
+        "data:text/html,<script>alert(1)</script>",
+        "about:config",
+        "ftp://mirror.kernel.org/",
+        "ssh://user@host:22",
+        "just-a-string",
+    ]
+    for url in rejected_urls:
+        assert open_external(url) is None
+    _assert_no_browser_spawn(browser_spawn_probe, "open_external (URLs não externas)")
+
+
+def test_open_external_suppressed_under_pytest_even_for_valid_external_url(browser_spawn_probe):
+    """Guarda 2 de open_external: ``pytest`` em ``sys.modules`` bloqueia o spawn
+    mesmo para uma URL externa legítima — a suíte nunca abre abas reais."""
+    assert "pytest" in sys.modules  # premissa do teste verificada de fato
+    assert browser_spawn_suppressed() is True
+    assert open_external("https://example.com/docs") is None
+    _assert_no_browser_spawn(browser_spawn_probe, "guarda pytest em sys.modules")
+
+
+def test_open_external_suppressed_by_disable_env_flag(browser_spawn_probe, monkeypatch):
+    """Guarda 2 de open_external: ``OPENCHAMBER_DISABLE_BROWSER_SPAWN=1`` bloqueia
+    o spawn de uma URL externa legítima sem levantar erro."""
+    monkeypatch.setenv("OPENCHAMBER_DISABLE_BROWSER_SPAWN", "1")
+    assert browser_spawn_suppressed() is True
+    assert open_external("https://example.com/docs") is None
+    _assert_no_browser_spawn(browser_spawn_probe, "flag OPENCHAMBER_DISABLE_BROWSER_SPAWN=1")
+
+
+def test_browser_spawn_suppressed_branch_matrix_is_pure():
+    """Ramificações de browser_spawn_suppressed de forma pura (env/modules
+    injetáveis, sem I/O), isolando cada guarda individualmente."""
+    # Nenhuma condição ativa → spawn permitido (produção normal)
+    assert browser_spawn_suppressed(env={}, modules={}) is False
+    # Ramificação da flag de ambiente, isolada do pytest
+    assert browser_spawn_suppressed(
+        env={"OPENCHAMBER_DISABLE_BROWSER_SPAWN": "1"}, modules={}) is True
+    # Valores distintos de "1" não ativam a flag
+    assert browser_spawn_suppressed(
+        env={"OPENCHAMBER_DISABLE_BROWSER_SPAWN": "0"}, modules={}) is False
+    assert browser_spawn_suppressed(
+        env={"OPENCHAMBER_DISABLE_BROWSER_SPAWN": "yes"}, modules={}) is False
+    # Ramificação do pytest, isolada da flag de ambiente
+    assert browser_spawn_suppressed(env={}, modules={"pytest": None}) is True
+    # Ambas simultaneamente
+    assert browser_spawn_suppressed(
+        env={"OPENCHAMBER_DISABLE_BROWSER_SPAWN": "1"},
+        modules={"pytest": None}) is True
+
+
+def _run_open_external_in_fresh_interpreter(
+    url: str,
+    disable_flag: typing.Optional[str] = None,
+) -> subprocess.CompletedProcess:
+    """Executa ``open_external`` num interpretador limpo (sem pytest carregado).
+
+    Reconstrói apenas o ambiente de PRODUÇÃO: ``pytest`` ausente de
+    ``sys.modules`` (interpretador novo) e a flag
+    ``OPENCHAMBER_DISABLE_BROWSER_SPAWN`` removida (a menos que seja
+    explicitamente solicitada). O spawn — se ocorrer — continua sendo
+    capturado pela sonda sentinel ``$BROWSER``/``PATH`` herdada do fixture,
+    nunca por um navegador real.
+    """
+    code = (
+        "import sys; "
+        f"sys.path[:0] = {[str(APP_DIR), str(venv_site)]!r}; "
+        "import app; "
+        f"app.open_external({url!r})"
+    )
+    env = os.environ.copy()
+    env.pop("OPENCHAMBER_DISABLE_BROWSER_SPAWN", None)
+    if disable_flag is not None:
+        env["OPENCHAMBER_DISABLE_BROWSER_SPAWN"] = disable_flag
+    venv_python = APP_DIR / "venv" / "bin" / "python"
+    interpreter = str(venv_python) if venv_python.exists() else sys.executable
+    return subprocess.run(
+        [interpreter, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def test_open_external_spawns_real_browser_path_outside_test_environment(browser_spawn_probe):
+    """Caminho feliz real (sem mocks): fora do pytest e sem a flag de corte,
+    open_external chega ao SO — capturado pela sonda, nunca por navegador real.
+
+    Prova que as guardas não quebram a abertura legítima de links externos em
+    produção.
+    """
+    result = _run_open_external_in_fresh_interpreter("https://example.com/positive")
+    assert result.returncode == 0, (
+        f"filho falhou: stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert _wait_for_spawn_marker(browser_spawn_probe), (
+        "fora do ambiente de teste open_external deveria disparar o spawn "
+        "(capturado pela sonda) e não disparou"
+    )
+    assert "https://example.com/positive" in browser_spawn_probe.read_text()
+
+
+def test_open_external_env_flag_blocks_spawn_outside_pytest(browser_spawn_probe):
+    """Ramificação da flag de ambiente isolada de verdade: interpretador limpo
+    (pytest NÃO está em sys.modules) com OPENCHAMBER_DISABLE_BROWSER_SPAWN=1
+    não pode disparar spawn algum.
+    """
+    result = _run_open_external_in_fresh_interpreter(
+        "https://example.com/blocked",
+        disable_flag="1",
+    )
+    assert result.returncode == 0, (
+        f"filho falhou: stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    _assert_no_browser_spawn(
+        browser_spawn_probe,
+        "OPENCHAMBER_DISABLE_BROWSER_SPAWN=1 fora do pytest",
+    )
 
 
 def test_desktop_handlers_js_paste_listener_structure():
@@ -782,3 +1027,437 @@ def test_app_py_restores_context_menu_right_after_browser_view_init():
     restore_call = content.index("preserve_default_context_menu(self)")
     shortcut_call = content.index("install_shortcut_listener(self, window)")
     assert init_call < restore_call < shortcut_call
+
+
+# =====================================================================
+# 8. TICKET-DESKTOP-10 — Contenção de repaints em idle/desfocada/minimizada
+#    (zero mocks: asserções estruturais sobre o JS real injetado + validação
+#     sintática com o binário Node.js do sistema)
+# =====================================================================
+
+IDLE_STYLE_ID = "__desktop_idle_style"
+IDLE_ROOT_CLASS = "oc-desktop-idle"
+
+
+def test_desktop_handlers_js_idle_css_containment_rule_structure():
+    """A tag de estilo dinâmico pausa animações de todos os elementos (incl. pseudo-elementos)."""
+    js = get_desktop_handlers_js()
+
+    assert f"getElementById('{IDLE_STYLE_ID}')" in js
+    assert f"el.id = '{IDLE_STYLE_ID}'" in js
+    assert "document.head.appendChild(el)" in js
+    assert "animation-play-state: paused !important" in js
+    # Regra precisa cobrir elemento, ::before e ::after (cursores piscantes são pseudo-elementos)
+    assert f"html.{IDLE_ROOT_CLASS} *," in js
+    assert f"html.{IDLE_ROOT_CLASS} *::before," in js
+    assert f"html.{IDLE_ROOT_CLASS} *::after" in js
+
+
+def test_desktop_handlers_js_idle_containment_is_scoped_not_global():
+    """A pausa é condicionada à classe raiz (preserva fluidez em interação ativa), nunca global."""
+    js = get_desktop_handlers_js()
+
+    rule_start = js.index(f"html.{IDLE_ROOT_CLASS} *")
+    rule_end = js.index("animation-play-state: paused !important", rule_start)
+    rule = js[js.index("'html.", js.index("el.textContent")):rule_end]
+    assert rule.startswith(f"'html.{IDLE_ROOT_CLASS}")
+    # A liberação remove a classe em vez de desligar a regra CSS
+    assert f"root.classList.add('{IDLE_ROOT_CLASS}')" in js
+    assert f"root.classList.remove('{IDLE_ROOT_CLASS}')" in js
+    # Nenhuma pausa global de animação fora do seletor da classe
+    assert "*, *::before, *::after { animation-play-state: paused" not in js
+
+
+def test_desktop_handlers_js_idle_window_and_visibility_listeners():
+    """Listeners de blur/focus na janela e visibilitychange no documento estão configurados."""
+    js = get_desktop_handlers_js()
+
+    assert "window.addEventListener('blur'" in js
+    assert "window.addEventListener('focus'" in js
+    assert "document.addEventListener('visibilitychange'" in js
+    assert "document.hidden" in js
+    # blur/oculto contenem; focus/visível liberam imediatamente
+    assert "setReason('blur', true)" in js
+    assert "setReason('blur', false)" in js
+
+
+def test_desktop_handlers_js_idle_watchdog_and_activity_listeners():
+    """Watchdog de 30s e todos os listeners de atividade do usuário estão presentes."""
+    js = get_desktop_handlers_js()
+
+    assert "window.__desktop_idle_timeout_ms = 30000" in js
+    assert "setTimeout(function()" in js
+    assert "clearTimeout(window.__desktop_idle_timer)" in js
+    assert "setReason('idle', true)" in js
+    assert "setReason('idle', false)" in js
+
+    # Monitoramento de atividade otimizado (throttled)
+    assert "window.__desktop_idle_activity_throttle_ms = 250" in js
+    for event in ("mousemove", "keydown", "wheel", "mousedown", "touchstart"):
+        assert f"'{event}'" in js, f"listener de atividade ausente: {event}"
+    assert "window.addEventListener('keydown', function() {" in js
+
+
+def test_desktop_handlers_js_idle_subsystem_is_idempotent_and_fail_soft():
+    """Flag de instalação única, IIFE com 'use strict' e try/catch em todo o caminho."""
+    js = get_desktop_handlers_js()
+
+    assert "if (!window.__desktop_idle_throttle_installed)" in js
+    assert "window.__desktop_idle_throttle_installed = true;" in js
+    # Subsistema isolado em IIFE para não vazar var no escopo global da página React
+    assert "(function() {" in js
+    assert "'use strict';" in js
+    # Fail-soft: guards contra documento ausente e catches em cada etapa
+    assert "typeof document === 'undefined'" in js
+    assert "typeof document !== 'undefined'" in js
+    assert js.count("catch (_)") >= 8
+    # Idempotência do sync: não re-aplica classe se o estado não mudou
+    assert "if (active === window.__desktop_idle_active)" in js
+    # Bloco idle vive dentro do guard global de instalação dos handlers
+    assert js.index("if (!window.__desktop_handlers_installed)") < js.index(
+        "if (!window.__desktop_idle_throttle_installed)"
+    )
+
+
+def test_desktop_handlers_js_idle_release_on_focus_and_visibility():
+    """focus e retorno para visible liberam blur E idle imediatamente e reagendam o watchdog."""
+    js = get_desktop_handlers_js()
+
+    focus_block = js[js.index("window.addEventListener('focus'"):js.index("document.addEventListener('visibilitychange'")]
+    assert "setReason('blur', false)" in focus_block
+    assert "setReason('idle', false)" in focus_block
+    assert "scheduleIdleWatchdog()" in focus_block
+
+    vis_block = js[js.index("document.addEventListener('visibilitychange'"):]
+    assert "setReason('blur', !!(document && document.hidden))" in vis_block
+    assert "scheduleIdleWatchdog()" in vis_block
+
+
+def test_desktop_handlers_js_is_valid_javascript_syntax(tmp_path):
+    """O script injetado inteiro passa na validação sintática real do Node.js do sistema."""
+    node = shutil.which("node")
+    assert node is not None, "binário node ausente do PATH — validação sintática impossível"
+
+    probe = tmp_path / "desktop_handlers_probe.js"
+    probe.write_text(get_desktop_handlers_js(), encoding="utf-8")
+
+    result = subprocess.run(
+        [node, "--check", str(probe)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+# =====================================================================
+# 9. TICKET-DESKTOP-11 — Reconexão ao backend, reciclagem de sessão e
+#    descarte de streams (zero mocks: exercício real do caminho de
+#    reciclagem com cooldown de 10s, asserções estruturais sobre o JS
+#    injetado e validação sintática com o binário Node.js do sistema)
+# =====================================================================
+
+RECONNECT_GUARD = "if (!window.__desktop_reconnect_installed)"
+RECONNECT_EVENT = "openchamber:backend-reconnected"
+RECONNECT_STORAGE_KEY = "openchamber:desktop:reconnect:last-reload"
+
+
+class WindowReloadProbe:
+    """Janela pywebview mínima que registra o script avaliado em ``evaluate_js``.
+
+    Mesmo espírito dos probes GObject já usados nesta suíte: permite exercitar
+    de forma determinística o caminho real de ``DesktopAPI.recycle_session``
+    sem iniciar o GTK (o pywebview real bloqueia em ``_pywebviewready`` sem GUI).
+    A sincronização usa ``wait_for_calls`` com prazo finito — sem mocks.
+    """
+
+    def __init__(self) -> None:
+        self.scripts: typing.List[str] = []
+        self._lock = threading.Lock()
+
+    def evaluate_js(self, script: str) -> None:
+        """Registra o script exatamente como o pywebview o receberia."""
+        with self._lock:
+            self.scripts.append(script)
+
+    @property
+    def calls(self) -> typing.List[str]:
+        """Retorna uma cópia estável dos scripts já registrados."""
+        with self._lock:
+            return list(self.scripts)
+
+    def wait_for_calls(self, count: int, timeout: float = 5.0) -> bool:
+        """Aguarda (prazo finito) até ``count`` chamadas serem registradas."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if len(self.calls) >= count:
+                return True
+            time.sleep(0.01)
+        return len(self.calls) >= count
+
+
+# ---------------------------------------------------------------------
+# 9.1 DesktopAPI.recycle_session / reload_page — ponte nativa de reciclagem
+# ---------------------------------------------------------------------
+
+def test_desktop_api_recycle_session_strict_signature():
+    """Assinatura determinística: reason/force tipados com defaults e retorno bool."""
+    hints = typing.get_type_hints(DesktopAPI.recycle_session)
+    assert hints["return"] is bool
+    assert hints["reason"] is str
+    assert hints["force"] is bool
+
+    signature = inspect.signature(DesktopAPI.recycle_session)
+    assert signature.parameters["reason"].default == "manual"
+    assert signature.parameters["force"].default is False
+
+
+def test_desktop_api_recycle_session_dispatches_reload_and_enforces_cooldown():
+    """Reciclagem real despacha window.location.reload() e respeita o cooldown anti-loop de 10s."""
+    probe = WindowReloadProbe()
+    previous_window = app_module._desktop_window
+    previous_ts = app_module._last_recycle_ts
+    app_module.register_desktop_window(probe)
+    app_module._last_recycle_ts = 0.0
+    try:
+        api = DesktopAPI()
+        assert api.recycle_session(reason="ticket11") is True
+        assert probe.wait_for_calls(1), "reload não foi despachado"
+        assert probe.calls == ["window.location.reload()"]
+
+        # Segunda reciclagem dentro do cooldown de 10s é suprimida (anti-loop).
+        assert api.recycle_session(reason="ticket11") is False
+        assert probe.calls == ["window.location.reload()"]
+
+        # force=True ignora o cooldown de forma explícita (uso programático).
+        assert api.recycle_session(reason="ticket11", force=True) is True
+        assert probe.wait_for_calls(2), "reload forçado não foi despachado"
+        assert probe.calls == ["window.location.reload()"] * 2
+    finally:
+        app_module._desktop_window = previous_window
+        app_module._last_recycle_ts = previous_ts
+
+
+def test_desktop_api_recycle_session_fail_soft_without_window():
+    """Sem janela registrada nem GUI ativa retorna False, sem exceção e sem consumir cooldown."""
+    previous_window = app_module._desktop_window
+    previous_ts = app_module._last_recycle_ts
+    app_module._desktop_window = None
+    app_module._last_recycle_ts = 0.0
+    try:
+        api = DesktopAPI()
+        assert api.recycle_session(reason="no-window") is False
+        # O caminho de falha não consome o cooldown (próxima chamada válida não é bloqueada).
+        assert app_module._last_recycle_ts == 0.0
+    finally:
+        app_module._desktop_window = previous_window
+        app_module._last_recycle_ts = previous_ts
+
+
+def test_desktop_api_reload_page_alias_delegates_to_recycle_session():
+    """reload_page() é alias público da reciclagem e honra o mesmo cooldown de 10s."""
+    api = DesktopAPI()
+    previous_ts = app_module._last_recycle_ts
+    app_module._last_recycle_ts = time.monotonic()  # cooldown ativo
+    try:
+        hints = typing.get_type_hints(DesktopAPI.reload_page)
+        assert hints["return"] is bool
+        assert api.reload_page(reason="alias") is False  # suprimida pelo cooldown
+    finally:
+        app_module._last_recycle_ts = previous_ts
+
+
+def test_setup_window_handlers_registers_desktop_window_for_recycling():
+    """setup_window_handlers registra a janela como alvo da reciclagem de sessão."""
+    previous_window = app_module._desktop_window
+    try:
+        w = webview.Window(uid='ticket11_recycle', title='ticket11_recycle', url='http://127.0.0.1:3000')
+        setup_window_handlers(w)
+        assert app_module._desktop_window is w
+    finally:
+        app_module._desktop_window = previous_window
+
+
+def test_app_py_recycle_session_wiring_source_structure():
+    """A estrutura fonte da ponte de reciclagem: cooldown 10s, thread daemon e registro da janela."""
+    content = (APP_DIR / "app.py").read_text(encoding="utf-8")
+    assert "_RECYCLE_COOLDOWN_S: float = 10.0" in content
+    assert "if not force and (now - _last_recycle_ts) < _RECYCLE_COOLDOWN_S:" in content
+    assert "threading.Thread(target=dispatch_reload, daemon=True).start()" in content
+    assert "target.evaluate_js('window.location.reload()')" in content
+    assert "def recycle_session(self, reason: str = 'manual', force: bool = False) -> bool:" in content
+    assert "register_desktop_window(window)" in content.split("def setup_window_handlers", 1)[1]
+
+
+# ---------------------------------------------------------------------
+# 9.2 Subsistema JS de reconexão — guarda, heartbeat e detecção de reinício
+# ---------------------------------------------------------------------
+
+def test_desktop_handlers_js_reconnect_guard_idempotent_and_isolated():
+    """Bloco de reconexão: guarda única, IIFE com 'use strict' e posicionamento pós-idle."""
+    js = get_desktop_handlers_js()
+
+    assert RECONNECT_GUARD in js
+    assert "window.__desktop_reconnect_installed = true;" in js
+    # Vive dentro do guard global de handlers e DEPOIS do idle do TICKET-10
+    assert js.index("if (!window.__desktop_handlers_installed)") < js.index(RECONNECT_GUARD)
+    assert js.index("if (!window.__desktop_idle_throttle_installed)") < js.index(RECONNECT_GUARD)
+
+    block = js[js.index(RECONNECT_GUARD):]
+    assert "(function() {" in block
+    assert "'use strict';" in block
+    for var in ("__desktop_reconnect_timer", "__desktop_reconnect_online", "__desktop_reconnect_offline_since", "__desktop_reconnect_instance_id", "__desktop_reconnect_restart_count"):
+        assert f"window.{var}" in block
+
+
+def test_desktop_handlers_js_reconnect_heartbeat_endpoints_and_interval():
+    """Heartbeat de 5s contra /api/system/info com fallback /health e timeout de abort."""
+    js = get_desktop_handlers_js()
+
+    assert "'/api/system/info'" in js
+    assert "'/health'" in js
+    assert "var RECONNECT_POLL_MS = 5000;" in js
+    assert "var RECONNECT_FETCH_TIMEOUT_MS = 4000;" in js
+    assert "cache: 'no-store'" in js
+    assert "typeof AbortController" in js
+    # Loop fail-soft com timer único idempotente
+    assert "clearTimeout(window.__desktop_reconnect_timer)" in js
+    assert "window.__desktop_reconnect_timer = null;" in js
+    # Só marca offline quando TODOS os endpoints responderem mal (fallback encadeado)
+    assert "if (attempt >= endpoints.length)" in js
+    assert "onBackendOffline()" in js
+
+
+def test_desktop_handlers_js_reconnect_detects_offline_transition_and_instance_change():
+    """Transição offline -> online e detecção de reinício via server_instance_id/pid renovado."""
+    js = get_desktop_handlers_js()
+
+    assert "window.__desktop_reconnect_online = false;" in js
+    assert "window.__desktop_reconnect_offline_since = nowMs();" in js
+    assert "var wasOffline = !window.__desktop_reconnect_online;" in js
+    assert "offlineMs" in js
+    # Chaves de identidade do daemon (server_instance_id renovado = reinício)
+    for key in ("'server_instance_id'", "'serverInstanceId'", "'instance_id'", "'instanceId'", "'pid'"):
+        assert key in js
+    assert "var instanceChanged = " in js
+    assert "window.__desktop_reconnect_restart_count += 1;" in js
+    assert "previousInstanceId" in js
+    assert "window.__desktop_reconnect_online = true;" in js
+    assert "window.__desktop_reconnect_offline_since = null;" in js
+
+
+def test_desktop_handlers_js_reconnect_dispatches_custom_event_with_detail():
+    """Evento openchamber:backend-reconnected carrega o detalhe completo da reconexão."""
+    js = get_desktop_handlers_js()
+
+    dispatch = "window.dispatchEvent(new CustomEvent('openchamber:backend-reconnected', { detail: detail }))"
+    assert dispatch in js
+
+    call_start = js.index("handleReconnect({")
+    detail_block = js[call_start:js.index("});", call_start)]
+    for field in ("at:", "wasOffline:", "offlineMs:", "instanceChanged:", "previousInstanceId:", "serverInstanceId:", "restartCount:"):
+        assert field in detail_block, f"campo ausente no detail do evento: {field}"
+
+
+def test_desktop_handlers_js_reconnect_discards_pending_streams_in_order():
+    """Descarte fecha EventSource/WebSocket em __openchamber_streams e globais, na ordem evento -> descarte -> reload."""
+    js = get_desktop_handlers_js()
+
+    assert "window.__openchamber_streams" in js
+    assert "Array.isArray(registry)" in js
+    assert "typeof target.close === 'function'" in js
+    for glob in ("'__openchamber_eventsource'", "'__openchamber_sse'", "'__openchamber_socket'", "'__openchamber_ws'", "'__eventSource'", "'__sse'", "'__socket'", "'__ws'"):
+        assert glob in js, f"global residual ausente do descarte: {glob}"
+    assert "window[globals[g]] = null;" in js
+
+    # Ordem obrigatória da spec: (a) evento -> (b) descarte de streams -> (c) recarga
+    handle = js.index("var handleReconnect = function(detail) {")
+    dispatch = js.index(RECONNECT_EVENT + "'", handle)
+    discard = js.index("discardPendingStreams();", dispatch)
+    reload = js.index("maybeReload(detail);", discard)
+    assert dispatch < discard < reload
+
+
+# ---------------------------------------------------------------------
+# 9.3 Recarga controlada — cooldown anti-loop de 10s e cancelas de reinício
+# ---------------------------------------------------------------------
+
+def test_desktop_handlers_js_reconnect_reload_anti_loop_cooldown():
+    """Cooldown de 10s persistido em sessionStorage (sobrevive ao próprio reload) + cancelas de reload."""
+    js = get_desktop_handlers_js()
+
+    assert "var RECONNECT_RELOAD_COOLDOWN_MS = 10000;" in js
+    assert f"var RECONNECT_STORAGE_KEY = '{RECONNECT_STORAGE_KEY}';" in js
+    assert "sessionStorage.getItem(RECONNECT_STORAGE_KEY)" in js
+    assert "sessionStorage.setItem(RECONNECT_STORAGE_KEY, String(ts));" in js
+    assert "return (nowMs() - readLastReloadTs()) >= cooldown;" in js
+    assert "persistLastReloadTs(nowMs());" in js
+    assert "window.location.reload();" in js
+    # Cancelas: reinício completo confirmado (queda prolongada) OU acúmulo de reinícios
+    assert "var RECONNECT_LONG_OFFLINE_MS = 4000;" in js
+    assert "var RECONNECT_RELOAD_AFTER_RESTARTS = 3;" in js
+    assert "var confirmedRestart = !!detail.instanceChanged && detail.offlineMs >= RECONNECT_LONG_OFFLINE_MS;" in js
+    assert "detail.restartCount >= restartsThreshold" in js
+    # Desligamento explícito pelo frontend
+    assert "cfg.autoReload === false" in js
+
+
+def test_desktop_handlers_js_reconnect_accepts_frontend_config_override():
+    """O frontend pode configurar heartbeat, endpoints e recarga via __desktop_reconnect_config."""
+    js = get_desktop_handlers_js()
+
+    assert "window.__desktop_reconnect_config || {}" in js
+    for key in ("cfg.pollIntervalMs", "cfg.endpoints", "cfg.reloadCooldownMs", "cfg.reloadAfterRestarts", "cfg.autoReload"):
+        assert key in js, f"chave de configuração ausente: {key}"
+
+
+def test_desktop_handlers_js_reconnect_is_fail_soft_and_preserves_existing_handlers():
+    """Fail-soft total no bloco novo e regressão intacta dos handlers dos TICKETs 04/07/10."""
+    js = get_desktop_handlers_js()
+
+    assert "typeof fetch !== 'function'" in js
+    assert js.count("catch (_)") >= 10
+    # Handlers existentes preservados (atalhos, links externos, clipboard, idle)
+    assert "window.addEventListener('keydown'" in js
+    assert "window.pywebview.api.open_external_link" in js
+    assert "window.pywebview.api.get_clipboard_image_base64" in js
+    assert "if (!window.__desktop_idle_throttle_installed)" in js
+
+    # A reconexão não duplica listeners de foco/visibilidade/atalho (isolamento estrito)
+    block = js[js.index(RECONNECT_GUARD):]
+    for evt in ("addEventListener('focus'", "addEventListener('blur'", "addEventListener('visibilitychange'", "addEventListener('keydown'", "addEventListener('paste'"):
+        assert evt not in block, f"bloco de reconexão não pode registrar listener duplicado: {evt}"
+
+
+def test_desktop_handlers_js_reconnect_valid_javascript_syntax(tmp_path):
+    """O script gerado (incl. subsistema de reconexão) passa no node --check real do sistema."""
+    node = shutil.which("node")
+    assert node is not None, "binário node ausente do PATH — validação sintática impossível"
+
+    js = get_desktop_handlers_js()
+    assert RECONNECT_GUARD in js  # garante que o script validado contém a reconexão
+
+    probe = tmp_path / "desktop_reconnect_probe.js"
+    probe.write_text(js, encoding="utf-8")
+
+    result = subprocess.run(
+        [node, "--check", str(probe)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_ticket11_production_and_tests_are_free_of_mocks():
+    """Anti-mock: nem o app.py (produção) nem esta suíte importam bibliotecas de mock."""
+    mock_tokens = (
+        "unit" + "test.mock",
+        "from unit" + "test import mock",
+        "Magic" + "Mock",
+        "mocker" + ".",
+    )
+    for path in (APP_DIR / "app.py", Path(__file__).resolve()):
+        content = path.read_text(encoding="utf-8")
+        for token in mock_tokens:
+            assert token not in content, f"mock proibido em {path.name}: {token}"

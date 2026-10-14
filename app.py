@@ -3,7 +3,9 @@ import base64
 import logging
 import shutil
 import subprocess
+import sys
 import threading
+import time
 import typing
 import urllib.parse
 import webbrowser
@@ -123,12 +125,79 @@ def is_external_url(url: str) -> bool:
         return False
 
 
+def browser_spawn_suppressed(
+    env: typing.Optional[typing.Mapping[str, str]] = None,
+    modules: typing.Optional[typing.Container[str]] = None,
+) -> bool:
+    """Indica se o spawn de navegador deve ser suprimido no ambiente atual.
+
+    Duas condições independentes, avaliadas sem nenhum efeito colateral:
+
+    * ``OPENCHAMBER_DISABLE_BROWSER_SPAWN=1`` — corte explícito para scripts,
+      smoke tests e sessões headless;
+    * ``pytest`` presente em ``sys.modules`` — qualquer execução da suíte
+      determinística bloqueia o spawn, blindando a máquina da usuária contra
+      abas/janelas reais de navegador.
+
+    O contrato dos argumentos é o mesmo de ``resolve_debug_mode``: quando os
+    parâmetros são ``None`` a fonte real é consultada (``os.environ`` e
+    ``sys.modules``); quando fornecidos, são a única fonte consultada — o que
+    torna cada ramificação testável de forma pura e determinística.
+
+    Args:
+        env: Mapping opcional de ambiente (padrão ``os.environ``).
+        modules: Container opcional de módulos carregados (padrão
+            ``sys.modules``).
+
+    Exemplo:
+        >>> browser_spawn_suppressed(env={}, modules={})
+        False
+        >>> browser_spawn_suppressed(env={}, modules={'pytest': None})
+        True
+        >>> browser_spawn_suppressed(
+        ...     env={'OPENCHAMBER_DISABLE_BROWSER_SPAWN': '1'}, modules={})
+        True
+        >>> browser_spawn_suppressed(
+        ...     env={'OPENCHAMBER_DISABLE_BROWSER_SPAWN': '0'}, modules={})
+        False
+    """
+    source: typing.Mapping[str, str] = os.environ if env is None else env
+    loaded: typing.Container[str] = sys.modules if modules is None else modules
+    return source.get('OPENCHAMBER_DISABLE_BROWSER_SPAWN') == '1' or 'pytest' in loaded
+
+
 def open_external(url: str) -> None:
-    """Abre URL externa no navegador padrão do sistema operacional."""
+    """Abre URL externa no navegador padrão do sistema operacional.
+
+    Guardas fail-fast avaliadas ANTES de qualquer side-effect no sistema
+    operacional (nenhuma das duas rotas — ``webbrowser.open`` ou
+    ``subprocess.run(['xdg-open', ...])`` — é alcançada quando uma guarda
+    dispara):
+
+    1. **Validação preliminar estrita:** ``url`` vazia/nula ou que não passe
+       em ``is_external_url`` (esquemas desconhecidos como ``javascript:``,
+       ``file:``, ``data:``, ``about:`` e hosts locais como ``localhost``/
+       ``127.0.0.1``) → retorno imediato.
+    2. **Ambiente de teste automatizado:** ``OPENCHAMBER_DISABLE_BROWSER_SPAWN=1``
+       ou ``pytest`` em ``sys.modules`` → retorno imediato, garantindo que a
+       suíte nunca abra abas reais na máquina da usuária.
+
+    Args:
+        url: URL a ser aberta. Vazias, inválidas ou locais são descartadas em
+            silêncio, sem levantar exceção.
+
+    Exemplo:
+        >>> open_external("")
+        >>> open_external("javascript:void(0)")
+        >>> open_external("http://localhost:3000")
+    """
+    if not url or not is_external_url(url):
+        return
+    if browser_spawn_suppressed():
+        return
     try:
         webbrowser.open(url)
     except Exception:
-        import subprocess
         subprocess.run(['xdg-open', url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
@@ -277,6 +346,30 @@ def on_closed():
         logger.debug("Falha ao parar openchamber no fechamento: %s", err)
 
 
+# TICKET-DESKTOP-11: janela pywebview ativa registrada para a ponte nativa de
+# reciclagem de sessão (DesktopAPI.recycle_session -> window.location.reload).
+_desktop_window: typing.Optional[webview.Window] = None
+
+# Cooldown anti-loop em segundos entre reciclagens de sessão acionadas via API.
+_RECYCLE_COOLDOWN_S: float = 10.0
+_last_recycle_ts: float = 0.0
+
+
+def register_desktop_window(window: webview.Window) -> None:
+    """Registra a janela pywebview ativa para que a DesktopAPI possa reciclá-la.
+
+    TICKET-DESKTOP-11: ponte nativa de reciclagem — o método
+    ``DesktopAPI.recycle_session()`` precisa alcançar a janela criada em
+    ``__main__`` para disparar ``window.location.reload()`` sem acoplar a API
+    ao ciclo de vida do GTK. Fail-soft: qualquer falha é logada em debug.
+    """
+    global _desktop_window
+    try:
+        _desktop_window = window
+    except Exception as err:
+        logger.debug("Falha ao registrar janela desktop para reciclagem: %s", err)
+
+
 class DesktopAPI:
     """API nativa exposta ao frontend via pywebview (window.pywebview.api)."""
 
@@ -328,9 +421,78 @@ class DesktopAPI:
         """Abre URL externa no navegador padrão do sistema operacional."""
         open_external(url)
 
+    def recycle_session(self, reason: str = 'manual', force: bool = False) -> bool:
+        """Solicita reload limpo da janela para forçar GC e descarte de nós órfãos.
+
+        TICKET-DESKTOP-11: ponte nativa acionável pelo frontend
+        (``window.pywebview.api.recycle_session()``) ou pelo desktop quando
+        ciclos de reinício do backend deixaram streams SSE/WebSocket, turnos e
+        chunks textuais antigos acumulados na árvore React/JavaScriptCore.
+
+        Proteção anti-loop: reciclagens consecutivas são suprimidas por
+        ``_RECYCLE_COOLDOWN_S`` (10s) salvo ``force=True``. O ``location.reload()``
+        é despachado em thread daemon (mesmo padrão do atalho F5/Ctrl+R) para
+        nunca bloquear a thread da chamada. Retorna True somente quando o
+        reload foi efetivamente despachado; qualquer falha é fail-soft (False).
+        """
+        global _last_recycle_ts
+        try:
+            now = time.monotonic()
+            if not force and (now - _last_recycle_ts) < _RECYCLE_COOLDOWN_S:
+                logger.debug(
+                    "Reciclagem de sessão suprimida pelo cooldown de %.0fs (reason=%s)",
+                    _RECYCLE_COOLDOWN_S, reason,
+                )
+                return False
+            target = _desktop_window
+            if target is None:
+                try:
+                    target = webview.active_window()
+                except Exception:
+                    target = None
+            if target is None:
+                logger.debug(
+                    "Reciclagem de sessão ignorada: janela desktop indisponível (reason=%s)",
+                    reason,
+                )
+                return False
+
+            def dispatch_reload() -> None:
+                """Avalia window.location.reload() na janela alvo sem propagar erros."""
+                try:
+                    target.evaluate_js('window.location.reload()')
+                except Exception as err:
+                    logger.debug("Falha ao despachar reload na janela desktop: %s", err)
+
+            _last_recycle_ts = now
+            threading.Thread(target=dispatch_reload, daemon=True).start()
+            logger.debug("Reciclagem de sessão despachada (reason=%s)", reason)
+            return True
+        except Exception as err:
+            logger.debug("Falha ao reciclar sessão desktop: %s", err)
+            return False
+
+    def reload_page(self, reason: str = 'frontend', force: bool = False) -> bool:
+        """Alias semântico de ``recycle_session`` para o frontend pedir reload limpo."""
+        return self.recycle_session(reason=reason, force=force)
+
 
 def get_desktop_handlers_js() -> str:
-    """Gera o script JavaScript injetado na janela para atalhos, links externos e colagem de imagens (TICKET-DESKTOP-07)."""
+    """Gera o script JavaScript injetado na janela para atalhos, links externos e colagem de imagens (TICKET-DESKTOP-07).
+
+    Inclui também o subsistema de contenção de animações CSS em idle/perda de
+    foco/janela oculta (TICKET-DESKTOP-10): pausa ``animation-play-state`` de
+    todos os elementos via classe ``oc-desktop-idle`` no ``<html>`` quando a
+    janela perde o foco, fica oculta (minimizada) ou o usuário fica inativo por
+    30s — eliminando repaints a 60 FPS e o transporte SharedMemory contínuo que
+    dispara o consumo de CPU do ``WebKitWebProcess`` + GTK main loop.
+
+    Inclui ainda o subsistema de reconexão ao backend (TICKET-DESKTOP-11):
+    heartbeat leve a cada 5s contra ``/api/system/info`` (fallback ``/health``)
+    detectando offline -> online e renovação de instância do daemon, com
+    evento ``openchamber:backend-reconnected``, descarte de EventSource/
+    WebSocket órfãos e recarga controlada com cooldown anti-loop de 10s.
+    """
     return """
         if (!window.__desktop_handlers_installed) {
             window.__desktop_handlers_installed = true;
@@ -392,6 +554,481 @@ def get_desktop_handlers_js() -> str:
                     }).catch(function() {});
                 }
             }, true);
+
+            // =====================================================================
+            // TICKET-DESKTOP-10 — Contenção de repaints em idle/desfocada/minimizada
+            // Pausa animações CSS contínuas (spinners, cursores, pulsos) para cortar
+            // os repaints a 60 FPS que mantêm WebKitWebProcess + GTK em CPU alta.
+            // =====================================================================
+            if (!window.__desktop_idle_throttle_installed) {
+                window.__desktop_idle_throttle_installed = true;
+                (function() {
+                    'use strict';
+                    // Estado idempotente: razões independentes (blur/oculto vs inatividade)
+                    // para que a liberação de uma não desfaça a outra.
+                    window.__desktop_idle_active = false;
+                    window.__desktop_idle_reasons = { blur: false, idle: false };
+                    window.__desktop_idle_timer = null;
+                    window.__desktop_idle_last_tick = 0;
+                    window.__desktop_idle_timeout_ms = 30000;
+                    window.__desktop_idle_activity_throttle_ms = 250;
+                    window.__desktop_idle_style_el = null;
+
+                    // a) Regra CSS dinâmica: pausa global de animações sob a classe raiz.
+                    var ensureIdleStyle = function() {
+                        try {
+                            if (window.__desktop_idle_style_el && window.__desktop_idle_style_el.parentNode) {
+                                return window.__desktop_idle_style_el;
+                            }
+                            if (typeof document === 'undefined' || !document.head) {
+                                return null;
+                            }
+                            var el = document.getElementById('__desktop_idle_style');
+                            if (!el) {
+                                el = document.createElement('style');
+                                el.id = '__desktop_idle_style';
+                                el.setAttribute('data-ticket', 'TICKET-DESKTOP-10');
+                                el.textContent = 'html.oc-desktop-idle *, html.oc-desktop-idle *::before, html.oc-desktop-idle *::after { animation-play-state: paused !important; }';
+                                document.head.appendChild(el);
+                            }
+                            window.__desktop_idle_style_el = el;
+                            return el;
+                        } catch (_) {
+                            return null;
+                        }
+                    };
+
+                    // Aplica/remove a contenção de forma idempotente e fail-soft.
+                    var syncIdleState = function() {
+                        try {
+                            var reasons = window.__desktop_idle_reasons;
+                            var active = !!(reasons.blur || reasons.idle);
+                            if (active === window.__desktop_idle_active) {
+                                return;
+                            }
+                            var root = (typeof document !== 'undefined') ? document.documentElement : null;
+                            if (!root || !root.classList) {
+                                return;
+                            }
+                            if (active) {
+                                if (!ensureIdleStyle()) {
+                                    return;
+                                }
+                                root.classList.add('oc-desktop-idle');
+                            } else {
+                                root.classList.remove('oc-desktop-idle');
+                            }
+                            window.__desktop_idle_active = active;
+                        } catch (_) {}
+                    };
+
+                    var setReason = function(name, value) {
+                        try {
+                            window.__desktop_idle_reasons[name] = !!value;
+                            syncIdleState();
+                        } catch (_) {}
+                    };
+
+                    // Watchdog de inatividade: ativa a contenção após 30s sem interação.
+                    var scheduleIdleWatchdog = function() {
+                        try {
+                            if (window.__desktop_idle_timer) {
+                                clearTimeout(window.__desktop_idle_timer);
+                            }
+                            window.__desktop_idle_timer = setTimeout(function() {
+                                window.__desktop_idle_timer = null;
+                                setReason('idle', true);
+                            }, window.__desktop_idle_timeout_ms);
+                        } catch (_) {}
+                    };
+
+                    // Atividade do usuário: libera a contenção de idle instantaneamente
+                    // e reagenda o watchdog (throttled para mousemove/wheel de alta taxa).
+                    var noteActivity = function(immediate) {
+                        try {
+                            if (window.__desktop_idle_reasons.idle) {
+                                setReason('idle', false);
+                            }
+                            var now = (typeof Date !== 'undefined' && Date.now) ? Date.now() : 0;
+                            if (!immediate && (now - window.__desktop_idle_last_tick) < window.__desktop_idle_activity_throttle_ms) {
+                                return;
+                            }
+                            window.__desktop_idle_last_tick = now;
+                            scheduleIdleWatchdog();
+                        } catch (_) {}
+                    };
+
+                    // c) Listeners de atividade do usuário (throttled).
+                    var activityEvents = ['mousemove', 'wheel', 'mousedown', 'touchstart'];
+                    for (var i = 0; i < activityEvents.length; i++) {
+                        (function(evt) {
+                            try {
+                                document.addEventListener(evt, function() {
+                                    noteActivity(evt === 'mousedown' || evt === 'touchstart');
+                                }, true);
+                            } catch (_) {}
+                        })(activityEvents[i]);
+                    }
+                    try {
+                        window.addEventListener('keydown', function() {
+                            noteActivity(true);
+                        }, true);
+                    } catch (_) {}
+
+                    // b) Eventos de janela / visibilidade: blur e oculto contenem
+                    // imediatamente; focus e visível removem a contenção imediatamente.
+                    try {
+                        window.addEventListener('blur', function() {
+                            setReason('blur', true);
+                        }, true);
+                        window.addEventListener('focus', function() {
+                            setReason('blur', false);
+                            setReason('idle', false);
+                            window.__desktop_idle_last_tick = (typeof Date !== 'undefined' && Date.now) ? Date.now() : 0;
+                            scheduleIdleWatchdog();
+                        }, true);
+                        document.addEventListener('visibilitychange', function() {
+                            try {
+                                setReason('blur', !!(document && document.hidden));
+                                if (!(document && document.hidden)) {
+                                    setReason('idle', false);
+                                    scheduleIdleWatchdog();
+                                }
+                            } catch (_) {}
+                        }, true);
+                    } catch (_) {}
+
+                    // Armadura inicial: inicia o watchdog (ainda sem contenção ativa).
+                    try {
+                        ensureIdleStyle();
+                        scheduleIdleWatchdog();
+                    } catch (_) {}
+                })();
+            }
+
+            // =====================================================================
+            // TICKET-DESKTOP-11 — Reconexão ao backend + reciclagem de streams
+            // Heartbeat leve (5s) contra /api/system/info com fallback /health:
+            // detecta queda -> retorno do daemon e renovação de instância
+            // (server_instance_id / pid), dispara openchamber:backend-reconnected,
+            // descarta EventSource/WebSocket órfãos e força reload limpo (GC da
+            // árvore React/JavaScriptCore) com cooldown anti-loop de 10s persistido
+            // em sessionStorage — o cooldown sobrevive ao próprio location.reload()
+            // e blinda contra loops de reload a cada boot do backend.
+            // =====================================================================
+            if (!window.__desktop_reconnect_installed) {
+                window.__desktop_reconnect_installed = true;
+                (function() {
+                    'use strict';
+
+                    // Parâmetros seguros por padrão; o frontend pode sobrescrevê-los
+                    // via window.__desktop_reconnect_config antes desta injeção.
+                    var RECONNECT_POLL_MS = 5000;
+                    var RECONNECT_FETCH_TIMEOUT_MS = 4000;
+                    var RECONNECT_LONG_OFFLINE_MS = 4000;
+                    var RECONNECT_RELOAD_COOLDOWN_MS = 10000;
+                    var RECONNECT_RELOAD_AFTER_RESTARTS = 3;
+                    var RECONNECT_STORAGE_KEY = 'openchamber:desktop:reconnect:last-reload';
+                    var RECONNECT_ENDPOINTS = ['/api/system/info', '/health'];
+
+                    window.__desktop_reconnect_timer = null;
+                    window.__desktop_reconnect_online = true;
+                    window.__desktop_reconnect_offline_since = null;
+                    window.__desktop_reconnect_instance_id = null;
+                    window.__desktop_reconnect_restart_count = 0;
+                    window.__desktop_reconnect_last_reload_ts = 0;
+                    window.__desktop_reconnect_ticks = 0;
+                    window.__desktop_reconnect_streams_discarded = 0;
+
+                    var nowMs = function() {
+                        try {
+                            return (typeof Date !== 'undefined' && Date.now) ? Date.now() : 0;
+                        } catch (_) {
+                            return 0;
+                        }
+                    };
+
+                    var readConfig = function() {
+                        try {
+                            return window.__desktop_reconnect_config || {};
+                        } catch (_) {
+                            return {};
+                        }
+                    };
+
+                    var readLastReloadTs = function() {
+                        try {
+                            if (typeof sessionStorage !== 'undefined' && sessionStorage) {
+                                var raw = sessionStorage.getItem(RECONNECT_STORAGE_KEY);
+                                var parsed = raw ? parseInt(raw, 10) : 0;
+                                if (isFinite(parsed) && parsed > 0) {
+                                    return parsed;
+                                }
+                            }
+                        } catch (_) {}
+                        return window.__desktop_reconnect_last_reload_ts || 0;
+                    };
+
+                    var persistLastReloadTs = function(ts) {
+                        window.__desktop_reconnect_last_reload_ts = ts;
+                        try {
+                            if (typeof sessionStorage !== 'undefined' && sessionStorage) {
+                                sessionStorage.setItem(RECONNECT_STORAGE_KEY, String(ts));
+                            }
+                        } catch (_) {}
+                    };
+
+                    var reloadCooldownElapsed = function() {
+                        var cooldown = RECONNECT_RELOAD_COOLDOWN_MS;
+                        try {
+                            var cfg = readConfig();
+                            if (typeof cfg.reloadCooldownMs === 'number' && cfg.reloadCooldownMs > 0) {
+                                cooldown = cfg.reloadCooldownMs;
+                            }
+                        } catch (_) {}
+                        return (nowMs() - readLastReloadTs()) >= cooldown;
+                    };
+
+                    var extractInstanceId = function(data) {
+                        try {
+                            if (!data || typeof data !== 'object') {
+                                return null;
+                            }
+                            var keys = ['server_instance_id', 'serverInstanceId', 'instance_id', 'instanceId', 'runtime_id', 'pid'];
+                            for (var i = 0; i < keys.length; i++) {
+                                var value = data[keys[i]];
+                                if (value !== undefined && value !== null && value !== '') {
+                                    return String(value);
+                                }
+                            }
+                        } catch (_) {}
+                        return null;
+                    };
+
+                    var closeStreamTarget = function(target) {
+                        try {
+                            if (target && typeof target.close === 'function') {
+                                target.close();
+                                return true;
+                            }
+                        } catch (_) {}
+                        return false;
+                    };
+
+                    // Descarte preventivo de streams pendentes: fecha EventSource e
+                    // WebSocket registrados em window.__openchamber_streams (array ou
+                    // mapa) e nas globais residuais de conexões de turnos anteriores.
+                    var discardPendingStreams = function() {
+                        var closed = 0;
+                        try {
+                            var registry = window.__openchamber_streams;
+                            if (registry && typeof registry === 'object') {
+                                if (Array.isArray(registry)) {
+                                    for (var i = 0; i < registry.length; i++) {
+                                        if (closeStreamTarget(registry[i])) {
+                                            closed++;
+                                        }
+                                    }
+                                } else {
+                                    var mapKeys = Object.keys(registry);
+                                    for (var k = 0; k < mapKeys.length; k++) {
+                                        if (closeStreamTarget(registry[mapKeys[k]])) {
+                                            closed++;
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (_) {}
+                        var globals = ['__openchamber_eventsource', '__openchamber_sse', '__openchamber_socket', '__openchamber_ws', '__eventSource', '__sse', '__socket', '__ws'];
+                        for (var g = 0; g < globals.length; g++) {
+                            try {
+                                if (closeStreamTarget(window[globals[g]])) {
+                                    closed++;
+                                    window[globals[g]] = null;
+                                }
+                            } catch (_) {}
+                        }
+                        window.__desktop_reconnect_streams_discarded = closed;
+                        return closed;
+                    };
+
+                    // Recarga controlada: somente após reinício completo confirmado
+                    // (mudança de instância + queda prolongada) ou após acúmulo de
+                    // reinícios, e sempre respeitando o cooldown anti-loop de 10s.
+                    var maybeReload = function(detail) {
+                        try {
+                            var cfg = readConfig();
+                            if (cfg.autoReload === false) {
+                                return;
+                            }
+                            var restartsThreshold = RECONNECT_RELOAD_AFTER_RESTARTS;
+                            if (typeof cfg.reloadAfterRestarts === 'number' && cfg.reloadAfterRestarts > 0) {
+                                restartsThreshold = cfg.reloadAfterRestarts;
+                            }
+                            var confirmedRestart = !!detail.instanceChanged && detail.offlineMs >= RECONNECT_LONG_OFFLINE_MS;
+                            var accumulatedRestarts = detail.restartCount >= restartsThreshold;
+                            if (!confirmedRestart && !accumulatedRestarts) {
+                                return;
+                            }
+                            if (!reloadCooldownElapsed()) {
+                                return;
+                            }
+                            persistLastReloadTs(nowMs());
+                            window.location.reload();
+                        } catch (_) {}
+                    };
+
+                    // Coordenada de reconexão: evento personalizado -> descarte de
+                    // streams -> recarga controlada (ordem do TICKET-DESKTOP-11).
+                    var handleReconnect = function(detail) {
+                        try {
+                            window.dispatchEvent(new CustomEvent('openchamber:backend-reconnected', { detail: detail }));
+                        } catch (_) {}
+                        try {
+                            discardPendingStreams();
+                        } catch (_) {}
+                        maybeReload(detail);
+                    };
+
+                    var onBackendOffline = function() {
+                        try {
+                            if (window.__desktop_reconnect_online) {
+                                window.__desktop_reconnect_online = false;
+                                window.__desktop_reconnect_offline_since = nowMs();
+                            }
+                        } catch (_) {}
+                    };
+
+                    var onBackendOnline = function(data) {
+                        try {
+                            var wasOffline = !window.__desktop_reconnect_online;
+                            var offlineMs = 0;
+                            if (wasOffline && window.__desktop_reconnect_offline_since) {
+                                offlineMs = Math.max(0, nowMs() - window.__desktop_reconnect_offline_since);
+                            }
+                            var instanceId = extractInstanceId(data);
+                            var previousInstanceId = window.__desktop_reconnect_instance_id;
+                            var instanceChanged = !!(instanceId && previousInstanceId && instanceId !== previousInstanceId);
+                            if (instanceChanged) {
+                                window.__desktop_reconnect_restart_count += 1;
+                            }
+                            if (wasOffline || instanceChanged) {
+                                handleReconnect({
+                                    at: nowMs(),
+                                    wasOffline: wasOffline,
+                                    offlineMs: offlineMs,
+                                    instanceChanged: instanceChanged,
+                                    previousInstanceId: previousInstanceId,
+                                    serverInstanceId: instanceId,
+                                    restartCount: window.__desktop_reconnect_restart_count
+                                });
+                            }
+                            if (instanceId) {
+                                window.__desktop_reconnect_instance_id = instanceId;
+                            }
+                            window.__desktop_reconnect_online = true;
+                            window.__desktop_reconnect_offline_since = null;
+                        } catch (_) {}
+                    };
+
+                    // Heartbeat: tenta /api/system/info e cai para /health se falhar;
+                    // só marca offline quando TODOS os endpoints responderem mal.
+                    var probeBackend = function() {
+                        var endpoints = RECONNECT_ENDPOINTS;
+                        try {
+                            var cfg = readConfig();
+                            if (Array.isArray(cfg.endpoints) && cfg.endpoints.length > 0) {
+                                endpoints = cfg.endpoints;
+                            }
+                        } catch (_) {}
+
+                        var attempt = 0;
+                        var settled = false;
+
+                        var failAttempt = function() {
+                            if (settled) {
+                                return;
+                            }
+                            attempt += 1;
+                            if (attempt >= endpoints.length) {
+                                settled = true;
+                                onBackendOffline();
+                                return;
+                            }
+                            fetchEndpoint();
+                        };
+
+                        var fetchEndpoint = function() {
+                            try {
+                                if (typeof fetch !== 'function') {
+                                    failAttempt();
+                                    return;
+                                }
+                                var controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+                                var guard = setTimeout(function() {
+                                    try {
+                                        if (controller) {
+                                            controller.abort();
+                                        }
+                                    } catch (_) {}
+                                }, RECONNECT_FETCH_TIMEOUT_MS);
+                                fetch(endpoints[attempt], { cache: 'no-store', signal: controller ? controller.signal : undefined })
+                                    .then(function(response) {
+                                        clearTimeout(guard);
+                                        if (!response || !response.ok) {
+                                            throw new Error('backend indisponível');
+                                        }
+                                        return response.json().catch(function() { return {}; });
+                                    })
+                                    .then(function(body) {
+                                        if (settled) {
+                                            return;
+                                        }
+                                        settled = true;
+                                        onBackendOnline(body || {});
+                                    })
+                                    .catch(function() {
+                                        clearTimeout(guard);
+                                        failAttempt();
+                                    });
+                            } catch (_) {
+                                failAttempt();
+                            }
+                        };
+
+                        fetchEndpoint();
+                    };
+
+                    // Loop de heartbeat fail-soft: tick fixo de 5s (ativo ou após
+                    // erro de rede), com guarda de idempotência de timer único.
+                    var scheduleTick = function() {
+                        try {
+                            if (window.__desktop_reconnect_timer) {
+                                clearTimeout(window.__desktop_reconnect_timer);
+                            }
+                            var interval = RECONNECT_POLL_MS;
+                            try {
+                                var cfg = readConfig();
+                                if (typeof cfg.pollIntervalMs === 'number' && cfg.pollIntervalMs >= 1000) {
+                                    interval = cfg.pollIntervalMs;
+                                }
+                            } catch (_) {}
+                            window.__desktop_reconnect_timer = setTimeout(function() {
+                                window.__desktop_reconnect_timer = null;
+                                window.__desktop_reconnect_ticks += 1;
+                                try {
+                                    probeBackend();
+                                } catch (_) {}
+                                scheduleTick();
+                            }, interval);
+                        } catch (_) {}
+                    };
+
+                    try {
+                        scheduleTick();
+                    } catch (_) {}
+                })();
+            }
         }
     """
 
@@ -403,6 +1040,10 @@ def setup_window_handlers(window: webview.Window) -> None:
     o listener no evento loaded para injetar os handlers de desktop (atalhos, links
     e colagem de imagem da área de transferência).
     """
+    # TICKET-DESKTOP-11: registra a janela como alvo da reciclagem de sessão
+    # (DesktopAPI.recycle_session) antes de expor os handlers ao frontend.
+    register_desktop_window(window)
+
     # Exposição de API para abertura de links externos via JavaScript
     def open_external_link(url: str) -> None:
         """Abre URL externa no navegador padrão."""
