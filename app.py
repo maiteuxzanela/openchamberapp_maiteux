@@ -1,4 +1,5 @@
 import os
+import base64
 import logging
 import shutil
 import subprocess
@@ -9,13 +10,57 @@ import webbrowser
 import gi
 gi.require_version('Gtk', '3.0')
 gi.require_version('Gdk', '3.0')
-from gi.repository import Gdk
+gi.require_version('GdkPixbuf', '2.0')
+from gi.repository import Gdk, GObject, Gtk, GdkPixbuf, GLib
 import webview
 import webview.platforms.gtk as gtk_plat
 
 logger = logging.getLogger("openchamber.desktop")
 
 URL = "http://127.0.0.1:3000"
+
+# TICKET-DESKTOP-09: valores aceitos como "verdadeiros" para OPENCHAMBER_DEBUG.
+# Qualquer outro valor (incluindo ausência da variável) mantém o modo de produção
+# com debug desligado — o padrão do app.
+_DEBUG_TRUTHY_VALUES: typing.FrozenSet[str] = frozenset({'1', 'true', 'yes', 'on'})
+
+
+def resolve_debug_mode(env: typing.Optional[typing.Mapping[str, str]] = None) -> bool:
+    """Resolve se o app deve subir com o modo de depuração do pywebview (TICKET-DESKTOP-09).
+
+    A resolução é pura e determinística: lê ``OPENCHAMBER_DEBUG`` do módulo
+    ``env`` (por padrão ``os.environ``), aplica ``strip()`` e compara em
+    minúsculas contra o conjunto de valores verdadeiros ``{'1', 'true', 'yes',
+    'on'}``. Qualquer outro valor ou a ausência da variável retorna ``False``,
+    mantendo o modo de produção como padrão.
+
+    Com ``debug=True`` o wrapper GTK do pywebview força
+    ``webkit_settings.enable_developer_extras = True``, o que mantém a
+    infraestrutura de depuração do JavaScriptCore alocada (threads
+    ``DebuggerDispatcher``/``InterruptDispatcher`` e heap anônimo retido). A
+    ativação passa a ser exclusivamente sob demanda: o ``run.sh`` exporta a
+    variável quando invocado com ``--debug``/``-d``.
+
+    Args:
+        env: Mapping opcional de ambiente. Quando ``None``, usa
+            ``os.environ``; quando fornecido, é a única fonte consultada
+            (o ambiente do processo não é contaminado).
+
+    Exemplo:
+        >>> resolve_debug_mode({'OPENCHAMBER_DEBUG': '1'})
+        True
+        >>> resolve_debug_mode({'OPENCHAMBER_DEBUG': '  True '})
+        True
+        >>> resolve_debug_mode({})
+        False
+        >>> resolve_debug_mode({'OPENCHAMBER_DEBUG': 'off'})
+        False
+    """
+    source: typing.Mapping[str, str] = os.environ if env is None else env
+    raw = source.get('OPENCHAMBER_DEBUG', '')
+    if not isinstance(raw, str):
+        return False
+    return raw.strip().lower() in _DEBUG_TRUTHY_VALUES
 
 
 def configure_graphics_environment() -> None:
@@ -160,17 +205,57 @@ def install_shortcut_listener(browse_view: typing.Any, window: webview.Window) -
         logger.debug("Falha ao conectar listener de atalhos na janela GTK: %s", err)
 
 
+def preserve_default_context_menu(browser_view: typing.Any) -> None:
+    """Restaura o menu de contexto padrão do WebKitGTK quando o debug está desligado (TICKET-DESKTOP-09).
+
+    Com ``debug=False`` o pywebview conecta em ``self.webview`` um handler
+    ``context-menu`` que devolve ``True`` e suprime o menu de clique direito
+    inteiro (copiar/colar/selecionar). Como o modo de produção agora nasce com
+    ``debug=False``, esse handler é desconectado logo após o ``__init__`` para
+    preservar a compatibilidade do menu de contexto com o comportamento atual do
+    app — a única perda em relação a ``debug=True`` continua sendo o item
+    "Inspecionar Elemento" (``enable_developer_extras`` segue desligado).
+
+    A desconexão é feita por ``g_signal_handlers_disconnect_matched`` com
+    ``G_SIGNAL_MATCH_ID``, atingindo somente os handlers do sinal
+    ``context-menu`` (o closure de classe do WebKit, que desenha o menu
+    padrão, não é afetado). Toda falha é fail-soft: nunca derruba o boot da
+    janela.
+
+    Exemplo:
+        >>> preserve_default_context_menu(object())  # sem .webview: fail-soft, não levanta exceção
+    """
+    if resolve_debug_mode():
+        return
+    widget = getattr(browser_view, 'webview', None)
+    if widget is None:
+        return
+    try:
+        signal_id = GObject.signal_lookup('context-menu', type(widget))
+        if not signal_id:
+            logger.debug("Sinal 'context-menu' indisponível em %s", type(widget).__name__)
+            return
+        GObject.signal_handlers_disconnect_matched(
+            widget, GObject.SignalMatchType.ID, signal_id, 0, None, None, None
+        )
+    except Exception as err:
+        logger.debug("Falha ao restaurar menu de contexto padrão: %s", err)
+
+
 def _custom_browser_view_init(self: typing.Any, window: webview.Window) -> None:
     """Estende o ``BrowserView.__init__`` do pywebview injetando o listener de atalhos.
 
     Mantém a inicialização original e delega a conexão do ``key-press-event``
     para :func:`install_shortcut_listener`, garantindo um único handler na janela.
+    Logo em seguida, :func:`preserve_default_context_menu` remove o bloqueio do
+    menu de contexto que o pywebview instala quando ``debug=False``.
 
     Exemplo:
         >>> callable(_custom_browser_view_init)
         True
     """
     _orig_browser_view_init(self, window)
+    preserve_default_context_menu(self)
     install_shortcut_listener(self, window)
 
 
@@ -192,19 +277,61 @@ def on_closed():
         logger.debug("Falha ao parar openchamber no fechamento: %s", err)
 
 
-def setup_window_handlers(window):
-    # Exposição de API para abertura de links externos via JavaScript
-    def open_external_link(url: str):
+class DesktopAPI:
+    """API nativa exposta ao frontend via pywebview (window.pywebview.api)."""
+
+    def get_clipboard_image_base64(self) -> typing.Optional[str]:
+        """Obtém imagem da área de transferência do sistema (Gdk.SELECTION_CLIPBOARD) em base64 PNG.
+
+        TICKET-DESKTOP-07: O WebKit2GTK no Linux não transfere dados binários de imagem
+        do Gdk.SELECTION_CLIPBOARD para o event.clipboardData do DOM nativamente.
+        Para evitar deadlock no Wayland ao ser chamado de worker threads do pywebview,
+        a requisição é despachada para a main thread via GLib.idle_add e aguarda
+        de forma assíncrona o callback de imagem via threading.Event(timeout=1.0).
+        Retorna a imagem serializada em base64 ascii ou None se não houver imagem,
+        em caso de timeout ou falha.
+        """
+        try:
+            event = threading.Event()
+            holder: typing.Dict[str, typing.Any] = {'pixbuf': None}
+
+            def on_image_received(clipboard: typing.Any, pixbuf: typing.Any, *args: typing.Any) -> None:
+                """Callback invocado pelo GTK quando a imagem da área de transferência é recebida."""
+                holder['pixbuf'] = pixbuf
+                event.set()
+
+            def request_image_in_main_thread() -> bool:
+                """Solicita a imagem do clipboard dentro do contexto da main thread do GTK."""
+                try:
+                    cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+                    cb.request_image(on_image_received)
+                except Exception as exc:
+                    logger.debug("Falha ao solicitar imagem na main thread: %s", exc)
+                    event.set()
+                return False
+
+            GLib.idle_add(request_image_in_main_thread)
+            event.wait(timeout=1.0)
+
+            pixbuf = holder.get('pixbuf')
+            if pixbuf is None:
+                return None
+            success, buffer = pixbuf.save_to_bufferv('png', [], [])
+            if not success or not buffer:
+                return None
+            return base64.b64encode(buffer).decode('ascii')
+        except Exception as err:
+            logger.debug("Falha ao capturar imagem do clipboard: %s", err)
+            return None
+
+    def open_external_link(self, url: str) -> None:
+        """Abre URL externa no navegador padrão do sistema operacional."""
         open_external(url)
 
-    try:
-        window.expose(open_external_link)
-    except Exception as err:
-        logger.debug("Falha ao expor open_external_link: %s", err)
 
-    # Registro de listeners em JavaScript (atalhos e links externos)
-    def on_loaded():
-        js_code = """
+def get_desktop_handlers_js() -> str:
+    """Gera o script JavaScript injetado na janela para atalhos, links externos e colagem de imagens (TICKET-DESKTOP-07)."""
+    return """
         if (!window.__desktop_handlers_installed) {
             window.__desktop_handlers_installed = true;
             window.addEventListener('keydown', function(e) {
@@ -228,8 +355,68 @@ def setup_window_handlers(window):
                     } catch (_) {}
                 }
             }, true);
+            window.addEventListener('paste', function(e) {
+                if (e.clipboardData && e.clipboardData.files && e.clipboardData.files.length > 0) {
+                    return;
+                }
+                if (e.clipboardData && e.clipboardData.getData('text') && (!e.clipboardData.files || e.clipboardData.files.length === 0)) {
+                    return;
+                }
+                if (window.pywebview && window.pywebview.api && window.pywebview.api.get_clipboard_image_base64) {
+                    window.pywebview.api.get_clipboard_image_base64().then(function(base64Data) {
+                        if (base64Data) {
+                            try {
+                                e.preventDefault();
+                            } catch (_) {}
+                            fetch('data:image/png;base64,' + base64Data)
+                                .then(function(res) { return res.blob(); })
+                                .then(function(blob) {
+                                    const file = new File([blob], 'pasted-image.png', { type: 'image/png' });
+                                    const fileInput = document.querySelector('input[type="file"][multiple]') || document.querySelector('input[type="file"]');
+                                    if (fileInput) {
+                                        const dt = new DataTransfer();
+                                        if (fileInput.files) {
+                                            for (let i = 0; i < fileInput.files.length; i++) {
+                                                dt.items.add(fileInput.files[i]);
+                                            }
+                                        }
+                                        dt.items.add(file);
+                                        fileInput.files = dt.files;
+                                        fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+                                    }
+                                })
+                                .catch(function(err) {
+                                    console.error('Erro ao processar imagem colada:', err);
+                                });
+                        }
+                    }).catch(function() {});
+                }
+            }, true);
         }
-        """
+    """
+
+
+def setup_window_handlers(window: webview.Window) -> None:
+    """Configura handlers de links externos e injeta listeners de desktop na janela.
+
+    Expõe a função open_external_link no escopo JavaScript da janela e registra
+    o listener no evento loaded para injetar os handlers de desktop (atalhos, links
+    e colagem de imagem da área de transferência).
+    """
+    # Exposição de API para abertura de links externos via JavaScript
+    def open_external_link(url: str) -> None:
+        """Abre URL externa no navegador padrão."""
+        open_external(url)
+
+    try:
+        window.expose(open_external_link)
+    except Exception as err:
+        logger.debug("Falha ao expor open_external_link: %s", err)
+
+    # Registro de listeners em JavaScript (atalhos, links externos e colagem de imagens)
+    def on_loaded() -> None:
+        """Injeta os scripts de atalhos e handlers de desktop no carregamento da janela."""
+        js_code = get_desktop_handlers_js()
         try:
             window.evaluate_js(js_code)
         except Exception as err:
@@ -239,20 +426,26 @@ def setup_window_handlers(window):
 
 
 if __name__ == '__main__':
+    desktop_api = DesktopAPI()
     window = webview.create_window(
         title='Open Chamber',
         url=URL,
         width=1200,
         height=800,
-        resizable=True
+        resizable=True,
+        js_api=desktop_api
     )
 
     window.events.closed += on_closed
     setup_window_handlers(window)
 
-    # Ativa armazenamento persistente; debug=True mantém o menu de contexto
-    # "Inspecionar Elemento" — a janela do inspector não abre no boot porque
-    # OPEN_DEVTOOLS_IN_DEBUG foi desligado no topo do módulo (TICKET-DESKTOP-08).
+    # TICKET-DESKTOP-09: debug sob demanda. ``resolve_debug_mode()`` devolve
+    # False em produção (OPENCHAMBER_DEBUG ausente), o que desliga
+    # ``enable_developer_extras`` no WebKitGTK e evita a alocação das threads
+    # DebuggerDispatcher/InterruptDispatcher com o respectivo vazamento de heap
+    # anônimo do JavaScriptCore. Com a flag ativa (``./run.sh --debug``) o menu
+    # de contexto "Inspecionar Elemento" volta a ficar disponível, sem abrir a
+    # janela do inspector no boot (OPEN_DEVTOOLS_IN_DEBUG=False, TICKET-DESKTOP-08).
     webview.settings['ALLOW_FILE_URLS'] = True
     webview.settings['OPEN_EXTERNAL_LINKS_IN_BROWSER'] = True
-    webview.start(gui='gtk', debug=True, private_mode=False, storage_path=os.path.expanduser('~/.cache/openchamber'))
+    webview.start(gui='gtk', debug=resolve_debug_mode(), private_mode=False, storage_path=os.path.expanduser('~/.cache/openchamber'))

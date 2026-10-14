@@ -1,6 +1,11 @@
 import os
+import base64
+import inspect
 import subprocess
 import sys
+import threading
+import time
+import typing
 from pathlib import Path
 import pytest
 
@@ -18,16 +23,22 @@ if venv_site.exists() and str(venv_site) not in sys.path:
 import gi
 gi.require_version('Gtk', '3.0')
 gi.require_version('Gdk', '3.0')
-from gi.repository import Gdk, GObject
+gi.require_version('GdkPixbuf', '2.0')
+from gi.repository import Gdk, GObject, Gtk, GdkPixbuf, GLib
 import webview
 
 from app import (
     is_external_url,
     resolve_openchamber_bin,
+    resolve_debug_mode,
+    preserve_default_context_menu,
     on_closed,
     configure_graphics_environment,
     create_shortcut_handler,
     install_shortcut_listener,
+    DesktopAPI,
+    get_desktop_handlers_js,
+    setup_window_handlers,
 )
 
 
@@ -305,10 +316,14 @@ def test_open_devtools_in_debug_is_disabled_at_import():
     assert webview.settings['OPEN_DEVTOOLS_IN_DEBUG'] is False
 
 
-def test_debug_flag_stays_true_so_inspect_element_remains_available():
-    """``debug=True`` precisa continuar em webview.start para o menu 'Inspecionar Elemento'."""
+def test_webview_start_uses_resolve_debug_mode_not_hardcoded_true():
+    """``webview.start`` recebe ``debug=resolve_debug_mode()``: produção nasce com debug desligado (TICKET-DESKTOP-09)."""
     content = (APP_DIR / "app.py").read_text()
-    assert "webview.start(gui='gtk', debug=True" in content
+    start_lines = [line for line in content.splitlines() if "webview.start(" in line]
+    assert start_lines, "webview.start não encontrado em app.py"
+    for line in start_lines:
+        assert "debug=resolve_debug_mode()" in line
+        assert "debug=True" not in line
 
 
 def test_graphics_environment_disables_dmabuf_for_nvidia():
@@ -382,3 +397,388 @@ def test_shortcut_handler_ignores_keys_that_are_not_shortcuts():
 
     assert handler(None, make_key_event(Gdk.KEY_a)) is False
     assert handler(None, make_key_event(Gdk.KEY_r, Gdk.ModifierType.CONTROL_MASK)) is True
+
+
+# =====================================================================
+# 6. TICKET-DESKTOP-07 — Colar imagem via clipboard (DesktopAPI & JS)
+# =====================================================================
+
+def invoke_clipboard_image_base64(api: DesktopAPI) -> typing.Optional[str]:
+    """Invoca get_clipboard_image_base64 em worker thread processando eventos GLib na main thread.
+
+    Simula deterministicamente o comportamento do pywebview, onde chamadas à js_api
+    rodam em worker threads separadas enquanto a main thread processa o loop de eventos GTK/GLib.
+    """
+    result: typing.Dict[str, typing.Optional[str]] = {'value': None}
+    exc_box: typing.Dict[str, typing.Optional[BaseException]] = {'error': None}
+
+    def worker() -> None:
+        try:
+            result['value'] = api.get_clipboard_image_base64()
+        except BaseException as exc:
+            exc_box['error'] = exc
+
+    t = threading.Thread(target=worker)
+    t.start()
+
+    ctx = GLib.MainContext.default()
+    while t.is_alive():
+        while ctx.pending():
+            ctx.iteration(False)
+        time.sleep(0.005)
+
+    t.join()
+    if exc_box['error'] is not None:
+        raise exc_box['error']
+    return result['value']
+
+
+def test_desktop_api_get_clipboard_image_base64_with_real_pixbuf():
+    """Valida serialização real de GdkPixbuf para PNG base64 via DesktopAPI (sem mocks)."""
+    cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+    pix = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, 32, 32)
+    cb.set_image(pix)
+    cb.store()
+
+    api = DesktopAPI()
+    result = invoke_clipboard_image_base64(api)
+
+    assert result is not None
+    assert isinstance(result, str)
+    raw = base64.b64decode(result)
+    assert raw.startswith(b'\x89PNG\r\n\x1a\n')
+
+    # Valida decodificação real de volta para pixbuf preservando dimensões 32x32
+    loader = GdkPixbuf.PixbufLoader.new_with_type('png')
+    loader.write(raw)
+    loader.close()
+    loaded = loader.get_pixbuf()
+    assert loaded.get_width() == 32
+    assert loaded.get_height() == 32
+
+
+def test_desktop_api_get_clipboard_image_base64_when_clipboard_has_text():
+    """Quando a área de transferência contém texto, get_clipboard_image_base64 deve retornar None."""
+    cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+    cb.set_text("Texto simples colado na área de transferência", -1)
+    cb.store()
+
+    api = DesktopAPI()
+    assert invoke_clipboard_image_base64(api) is None
+
+
+def test_desktop_api_get_clipboard_image_base64_when_clipboard_cleared():
+    """Quando o clipboard é limpo, get_clipboard_image_base64 deve retornar None."""
+    cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+    cb.clear()
+
+    api = DesktopAPI()
+    assert invoke_clipboard_image_base64(api) is None
+
+
+def test_desktop_api_get_clipboard_image_base64_timeout_returns_none():
+    """Quando a espera síncrona sofre timeout (1.0s) sem callback, retorna None com segurança."""
+    api = DesktopAPI()
+    # Chamada direta sem iterar o loop GLib dispara o timeout de 1.0s com segurança e sem travar
+    result = api.get_clipboard_image_base64()
+    assert result is None
+
+
+def test_desktop_api_open_external_link_fail_soft_on_empty_url():
+    """Valida que open_external_link lida suavemente com URL vazia ou inválida sem exceção."""
+    api = DesktopAPI()
+    api.open_external_link("")
+    api.open_external_link("javascript:void(0)")
+
+
+def test_desktop_handlers_js_paste_listener_structure():
+    """Valida a presença e integridade do listener de paste no script injetado."""
+    js = get_desktop_handlers_js()
+
+    assert "window.addEventListener('paste'" in js
+    assert "e.clipboardData.files" in js
+    assert "e.clipboardData.getData('text')" in js
+    assert "window.pywebview.api.get_clipboard_image_base64" in js
+    assert "e.preventDefault()" in js
+    assert "fetch('data:image/png;base64,' + base64Data)" in js
+    assert "res.blob()" in js
+    assert "new File([blob], 'pasted-image.png', { type: 'image/png' })" in js
+    assert "input[type=\"file\"][multiple]" in js
+    assert "new DataTransfer()" in js
+    assert "dispatchEvent(new Event('change', { bubbles: true }))" in js
+
+
+def test_desktop_handlers_js_idempotent_installation_guard():
+    """Valida que o script possui flag guard para evitar injeção duplicada de listeners."""
+    js = get_desktop_handlers_js()
+    assert "window.__desktop_handlers_installed" in js
+    assert "if (!window.__desktop_handlers_installed)" in js
+
+
+def test_desktop_api_wires_into_pywebview_window():
+    """Valida que js_api=DesktopAPI() é aceito pelo pywebview e armazena a instância em _js_api."""
+    api = DesktopAPI()
+    w = webview.Window(uid='test_api', title='test_api', url='http://127.0.0.1:3000', js_api=api)
+    assert w._js_api is api
+    assert hasattr(w._js_api, 'get_clipboard_image_base64')
+    assert callable(w._js_api.get_clipboard_image_base64)
+
+
+def test_setup_window_handlers_connects_loaded_event():
+    """Valida que setup_window_handlers registra handler no evento loaded do pywebview."""
+    w = webview.Window(uid='test_load', title='test_load', url='http://127.0.0.1:3000')
+    initial_handlers_count = len(w.events.loaded)
+    setup_window_handlers(w)
+    assert len(w.events.loaded) == initial_handlers_count + 1
+
+
+def test_app_main_passes_js_api_desktop_api():
+    """Valida que no ponto de entrada (__main__) do app.py, js_api é configurado com DesktopAPI."""
+    content = (APP_DIR / "app.py").read_text()
+    assert "desktop_api = DesktopAPI()" in content
+    assert "js_api=desktop_api" in content
+
+
+# =====================================================================
+# 7. TICKET-DESKTOP-09 — resolve_debug_mode, flag --debug no run.sh
+#    e preservação do menu de contexto (zero mocks)
+# =====================================================================
+
+RUN_SH_ARG_PARSE_BEGIN = "# >>> OPENCHAMBER_ARG_PARSE_BEGIN"
+RUN_SH_ARG_PARSE_END = "# <<< OPENCHAMBER_ARG_PARSE_END"
+
+
+def extract_run_sh_arg_parse_block() -> str:
+    """Extrai o bloco real de parsing de argumentos do run.sh (sem cópia manual do código)."""
+    lines = (APP_DIR / "run.sh").read_text().splitlines()
+    begin = next((i for i, line in enumerate(lines) if RUN_SH_ARG_PARSE_BEGIN in line), None)
+    end = next((i for i, line in enumerate(lines) if RUN_SH_ARG_PARSE_END in line), None)
+    assert begin is not None, "marcador OPENCHAMBER_ARG_PARSE_BEGIN ausente em run.sh"
+    assert end is not None and end > begin, "marcador OPENCHAMBER_ARG_PARSE_END inválido em run.sh"
+    return "\n".join(lines[begin:end + 1])
+
+
+def run_sh_parse_env(argv: typing.List[str], inherited: typing.Optional[str] = None) -> str:
+    """Executa o bloco real de parsing do run.sh em bash e devolve o OPENCHAMBER_DEBUG resultante."""
+    script = extract_run_sh_arg_parse_block() + '\nprintf "%s" "${OPENCHAMBER_DEBUG-__UNSET__}"\n'
+    env = dict(os.environ)
+    env.pop("OPENCHAMBER_DEBUG", None)
+    if inherited is not None:
+        env["OPENCHAMBER_DEBUG"] = inherited
+
+    result = subprocess.run(
+        ["bash", "-c", script, "openchamber_arg_parse"] + list(argv),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+# ---------------------------------------------------------------------
+# 7.1 resolve_debug_mode() — tipagem estrita e matriz de valores
+# ---------------------------------------------------------------------
+
+def test_resolve_debug_mode_has_strict_typing_signature():
+    """Assinatura determinística: env opcional tipado como Optional[Mapping[str, str]] e retorno bool."""
+    hints = typing.get_type_hints(resolve_debug_mode)
+    assert hints["return"] is bool
+    assert hints["env"] == typing.Optional[typing.Mapping[str, str]]
+    signature = inspect.signature(resolve_debug_mode)
+    assert signature.parameters["env"].default is None
+
+
+@pytest.mark.parametrize("value", [
+    "1",
+    "true",
+    "True",
+    "TRUE",
+    "tRuE",
+    "yes",
+    "YES",
+    "on",
+    "On",
+    " 1 ",
+    "  True  ",
+    "\tYES\n",
+])
+def test_resolve_debug_mode_truthy_values_return_true(value):
+    """Valores verdadeiros (com strip e case-insensitive) ativam o modo de depuração."""
+    assert resolve_debug_mode({"OPENCHAMBER_DEBUG": value}) is True
+
+
+@pytest.mark.parametrize("value", [
+    "0",
+    "false",
+    "False",
+    "FALSE",
+    "no",
+    "off",
+    "OFF",
+    "",
+    "   ",
+    "invalid",
+    "2",
+    "y",
+    "enabled",
+    "truely",
+])
+def test_resolve_debug_mode_falsy_values_return_false(value):
+    """Qualquer valor fora da matriz de verdadeiros mantém o modo de produção desligado."""
+    assert resolve_debug_mode({"OPENCHAMBER_DEBUG": value}) is False
+
+
+def test_resolve_debug_mode_absent_key_returns_false():
+    """Sem a chave OPENCHAMBER_DEBUG no mapping o padrão é produção (False)."""
+    assert resolve_debug_mode({}) is False
+
+
+def test_resolve_debug_mode_defaults_to_process_environment(monkeypatch):
+    """Sem env explícito, lê os.environ de forma determinística nos dois sentidos."""
+    monkeypatch.delenv("OPENCHAMBER_DEBUG", raising=False)
+    assert resolve_debug_mode() is False
+
+    monkeypatch.setenv("OPENCHAMBER_DEBUG", "true")
+    assert resolve_debug_mode() is True
+
+
+def test_resolve_debug_mode_explicit_env_overrides_process_environment(monkeypatch):
+    """Mapping explícito tem precedência exclusiva e não contamina os.environ."""
+    monkeypatch.setenv("OPENCHAMBER_DEBUG", "1")
+    assert resolve_debug_mode({}) is False
+    assert resolve_debug_mode({"OPENCHAMBER_DEBUG": "0"}) is False
+    assert resolve_debug_mode({"OPENCHAMBER_DEBUG": "on"}) is True
+    assert os.environ["OPENCHAMBER_DEBUG"] == "1"
+
+
+def test_resolve_debug_mode_handles_non_string_values_fail_soft():
+    """Valores fora do contrato str (defesa) retornam False sem levantar exceção."""
+    assert resolve_debug_mode({"OPENCHAMBER_DEBUG": None}) is False
+    assert resolve_debug_mode({"OPENCHAMBER_DEBUG": 1}) is False
+
+
+def test_resolve_debug_mode_is_wired_into_webview_start():
+    """O ponto de entrada usa resolve_debug_mode() e nunca debug=True hardcoded."""
+    content = (APP_DIR / "app.py").read_text()
+    assert "debug=resolve_debug_mode()" in content
+    assert "webview.start(gui='gtk', debug=True" not in content
+
+
+# ---------------------------------------------------------------------
+# 7.2 run.sh — repasse de argumentos e flag --debug / -d
+# ---------------------------------------------------------------------
+
+@pytest.mark.parametrize("flag", ["--debug", "-d"])
+def test_run_sh_debug_flag_exports_openchamber_debug(flag):
+    """./run.sh --debug (ou -d) exporta OPENCHAMBER_DEBUG=1 para o app.py."""
+    assert run_sh_parse_env([flag]) == "1"
+
+
+def test_run_sh_debug_flag_works_mixed_with_other_args():
+    """A flag é detectada mesmo com outros argumentos à frente/atrás, sem descartá-los."""
+    assert run_sh_parse_env(["--other", "--debug", "foo"]) == "1"
+    assert run_sh_parse_env(["-d", "extra"]) == "1"
+
+
+def test_run_sh_without_debug_flag_leaves_env_unset():
+    """Sem a flag, OPENCHAMBER_DEBUG permanece inalterada (produção)."""
+    assert run_sh_parse_env([]) == "__UNSET__"
+    assert run_sh_parse_env(["--help", "chat"]) == "__UNSET__"
+
+
+def test_run_sh_preserves_preexisting_openchamber_debug_without_flag():
+    """Env já exportada pelo usuário é preservada quando não há flag de debug."""
+    assert run_sh_parse_env([], inherited="0") == "0"
+    assert run_sh_parse_env([], inherited="true") == "true"
+
+
+def test_run_sh_forwards_cli_args_to_app_and_keeps_trap_cleanup():
+    """Argumentos são repassados ao app.py e o trap cleanup do DEF-01 permanece intacto."""
+    content = (APP_DIR / "run.sh").read_text()
+    assert 'app.py" "$@"' in content
+    assert "trap cleanup EXIT INT TERM" in content
+    assert 'if [ "$OPENCHAMBER_KEEP_SERVER" = "1" ]; then' in content
+
+    syntax = subprocess.run(["bash", "-n", str(APP_DIR / "run.sh")], capture_output=True, text=True)
+    assert syntax.returncode == 0, syntax.stderr
+
+
+def test_run_sh_parse_block_is_valid_and_contained():
+    """O bloco de parsing é sintaticamente válido sozinho e não altera o fluxo do cleanup."""
+    block = extract_run_sh_arg_parse_block()
+    assert "--debug|-d" in block
+    assert "OPENCHAMBER_DEBUG=1" in block
+
+    check = subprocess.run(["bash", "-n"], input=block, capture_output=True, text=True)
+    assert check.returncode == 0, check.stderr
+
+
+# ---------------------------------------------------------------------
+# 7.3 Menu de contexto: bloqueio do pywebview é removido com debug off
+# ---------------------------------------------------------------------
+
+class ContextMenuProbe(GObject.Object):
+    """Widget real (GObject) exposto ao sinal ``context-menu`` idêntico ao do WebKitGTK.
+
+    Usa o mesmo mecanismo de sinal GObject/GLib do ``WebKit2.WebView`` de
+    produção, permitindo auditar a remoção do bloqueio do pywebview sem display.
+    """
+
+    __gsignals__ = {
+        'context-menu': (GObject.SignalFlags.RUN_LAST, bool, (object, object, object, object)),
+    }
+
+
+class BrowserViewWithContext:
+    """Possui o atributo ``webview`` consumido por ``preserve_default_context_menu``."""
+
+    def __init__(self, webview_widget: typing.Any) -> None:
+        self.webview = webview_widget
+
+
+def test_preserve_default_context_menu_removes_blocker_when_debug_disabled(monkeypatch):
+    """Com OPENCHAMBER_DEBUG ausente, o handler de bloqueio do pywebview é desconectado."""
+    monkeypatch.delenv("OPENCHAMBER_DEBUG", raising=False)
+    probe = ContextMenuProbe()
+    blocked: typing.List[str] = []
+    probe.connect('context-menu', lambda *args: blocked.append('hit') or True)
+
+    preserve_default_context_menu(BrowserViewWithContext(probe))
+
+    probe.emit('context-menu', None, None, None, None)
+    assert blocked == []
+
+
+def test_preserve_default_context_menu_keeps_blocker_when_debug_enabled(monkeypatch):
+    """Com OPENCHAMBER_DEBUG ativa, o pywebview não liga o bloqueio e nada é desconectado."""
+    monkeypatch.setenv("OPENCHAMBER_DEBUG", "1")
+    probe = ContextMenuProbe()
+    blocked: typing.List[str] = []
+    probe.connect('context-menu', lambda *args: blocked.append('hit') or True)
+
+    preserve_default_context_menu(BrowserViewWithContext(probe))
+
+    probe.emit('context-menu', None, None, None, None)
+    assert blocked == ['hit']
+
+
+def test_preserve_default_context_menu_is_fail_soft(monkeypatch):
+    """Sem .webview ou sem o sinal 'context-menu' a função não levanta exceção (fail-soft)."""
+    monkeypatch.delenv("OPENCHAMBER_DEBUG", raising=False)
+    preserve_default_context_menu(object())
+
+    class WithoutContextMenuSignal(GObject.Object):
+        pass
+
+    preserve_default_context_menu(BrowserViewWithContext(WithoutContextMenuSignal()))
+
+
+def test_app_py_restores_context_menu_right_after_browser_view_init():
+    """A restauração é chamada logo após o __init__ original e antes do listener de atalhos."""
+    content = (APP_DIR / "app.py").read_text()
+    init_call = content.index("_orig_browser_view_init(self, window)")
+    restore_call = content.index("preserve_default_context_menu(self)")
+    shortcut_call = content.index("install_shortcut_listener(self, window)")
+    assert init_call < restore_call < shortcut_call
