@@ -121,7 +121,8 @@ def is_external_url(url: str) -> bool:
         if parsed.scheme in ('mailto', 'tel'):
             return True
         return False
-    except Exception:
+    except Exception as err:
+        logger.debug("Falha ao analisar URL externa: %s", err)
         return False
 
 
@@ -197,7 +198,8 @@ def open_external(url: str) -> None:
         return
     try:
         webbrowser.open(url)
-    except Exception:
+    except Exception as err:
+        logger.debug("Falha ao abrir com xdg-open: %s", err)
         subprocess.run(['xdg-open', url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
@@ -331,6 +333,123 @@ def _custom_browser_view_init(self: typing.Any, window: webview.Window) -> None:
 gtk_plat.BrowserView.__init__ = _custom_browser_view_init
 
 
+# =============================================================================
+# TICKET-DESKTOP-06..11 (regressao JS multibyte) - defesa em profundidade.
+#
+# CAUSA RAIZ: em ``webview/platforms/gtk.py`` o ``BrowserView.evaluate_js``
+# enviava ``length=len(script)`` - CODE POINTS do Python - a
+# ``webkit_web_view_evaluate_javascript``, cuja API C interpreta o parametro
+# como BYTES UTF-8. Um payload com 64 caracteres nao-ASCII (2 bytes cada em
+# UTF-8) informava 64 bytes a menos que o real: o WebKit lia so o prefixo,
+# truncava o script e abortava com ``SyntaxError: Unexpected end of script``.
+#
+# MITIGACAO: ``length=-1`` e o sentinela do WebKitGTK para "string terminada em
+# NUL", o que torna o comprimento independente da contagem de code points e
+# correto para qualquer payload (ASCII ou UTF-8). A assinatura
+# ``(self, script, parse_json)``, o tratamento de ``parse_json`` e o valor de
+# retorno do original sao integralmente preservados; toda falha e fail-soft.
+# =============================================================================
+
+
+def _desktop_js_eval_length(script: str) -> int:
+    """Comprimento de ``script`` a enviar ao ``evaluate_javascript`` do WebKitGTK.
+
+    Seam puro e deterministico (sem GTK/display, testavel por introspeccao)
+    usado pelo monkeypatch :func:`install_evaluate_js_length_patch`. Devolve o
+    sentinela ``-1`` (= string terminada em NUL para a API C do WebKitGTK), em
+    vez de ``len(script)`` (CODE POINTS do Python), que divergia dos BYTES UTF-8
+    esperados pela API C e truncava payloads multibyte (TICKET-DESKTOP-06..11).
+
+    Exemplo:
+        >>> _desktop_js_eval_length("")
+        -1
+        >>> _desktop_js_eval_length("abc")
+        -1
+        >>> _desktop_js_eval_length("acentuacao: \u00e1\u00e9\u00ee\u2014")
+        -1
+    """
+    return -1
+
+
+_orig_evaluate_js = gtk_plat.BrowserView.evaluate_js
+
+
+def _custom_evaluate_js(self: typing.Any, script: str, parse_json: bool) -> typing.Any:
+    """Reimplementa ``BrowserView.evaluate_js`` com ``length=-1`` (TICKET-DESKTOP-06..11).
+
+    Espelha fielmente o ``evaluate_js`` do pywebview: mesma assinatura
+    ``(self, script, parse_json)``, mesmo tratamento de ``parse_json`` sobre o
+    valor convertido e mesmo retorno sincrono via ``Semaphore``. A unica
+    diferenca e o comprimento enviado a ``evaluate_javascript``, que passa a vir
+    de :func:`_desktop_js_eval_length` (``-1`` = string terminada em NUL), em vez
+    de ``len(script)`` (code points) - que truncava payloads multibyte.
+
+    Exemplo:
+        >>> callable(_custom_evaluate_js)
+        True
+    """
+
+    def _evaluate_js() -> None:
+        try:
+            self.webview.evaluate_javascript(
+                script=script,
+                length=_desktop_js_eval_length(script),
+                world_name=None,
+                source_uri=None,
+                cancellable=None,
+                callback=_callback,
+            )
+        except Exception:
+            gtk_plat.logger.exception('Error evaluating JavaScript')
+            result_semaphore.release()
+
+    def _callback(webview: typing.Any, task: typing.Any) -> None:
+        nonlocal result
+        try:
+            value = webview.evaluate_javascript_finish(task)
+            res = self._convert_js_value(value)
+            if parse_json and res:
+                try:
+                    result = gtk_plat.json.loads(res)
+                except Exception as err:
+                    logger.debug("Falha ao decodificar JSON de evaluate_js: %s", err)
+            else:
+                result = res
+        except Exception as err:
+            gtk_plat.logger.exception(err)
+        result_semaphore.release()
+
+    result_semaphore = gtk_plat.Semaphore(0)
+    result: typing.Any = None
+    gtk_plat.glib.idle_add(_evaluate_js)
+    if not result_semaphore.acquire(timeout=5.0):
+        logger.warning("Timeout aguardando execucao de evaluate_js no GTK")
+    return result
+
+
+def install_evaluate_js_length_patch() -> bool:
+    """Instala o monkeypatch ``length=-1`` em ``BrowserView.evaluate_js`` (fail-soft).
+
+    Substitui ``webview.platforms.gtk.BrowserView.evaluate_js`` pela versao
+    :func:`_custom_evaluate_js`, corrigindo a divergencia entre code points
+    (Python) e bytes UTF-8 (API C do WebKitGTK) que truncava payloads multibyte.
+    E aplicado no import do modulo e e idempotente. Qualquer falha e fail-soft:
+    o metodo original permanece intacto e o boot nunca e derrubado.
+
+    Returns:
+        True quando o patch foi aplicado; False em caso de falha.
+    """
+    try:
+        gtk_plat.BrowserView.evaluate_js = _custom_evaluate_js
+        return True
+    except Exception as err:
+        logger.debug("Falha ao instalar patch length=-1 em evaluate_js: %s", err)
+        return False
+
+
+install_evaluate_js_length_patch()
+
+
 def resolve_openchamber_bin() -> str:
     """Resolve o executável do openchamber no PATH ou fallback local."""
     return shutil.which('openchamber') or os.path.expanduser('~/.local/node/bin/openchamber')
@@ -448,7 +567,8 @@ class DesktopAPI:
             if target is None:
                 try:
                     target = webview.active_window()
-                except Exception:
+                except Exception as err:
+                    logger.debug("Falha ao reciclar sessao: %s", err)
                     target = None
             if target is None:
                 logger.debug(
@@ -480,18 +600,39 @@ class DesktopAPI:
 def get_desktop_handlers_js() -> str:
     """Gera o script JavaScript injetado na janela para atalhos, links externos e colagem de imagens (TICKET-DESKTOP-07).
 
-    Inclui também o subsistema de contenção de animações CSS em idle/perda de
+    Inclui tambem o subsistema de contencao de animacoes CSS em idle/perda de
     foco/janela oculta (TICKET-DESKTOP-10): pausa ``animation-play-state`` de
     todos os elementos via classe ``oc-desktop-idle`` no ``<html>`` quando a
-    janela perde o foco, fica oculta (minimizada) ou o usuário fica inativo por
-    30s — eliminando repaints a 60 FPS e o transporte SharedMemory contínuo que
+    janela perde o foco, fica oculta (minimizada) ou o usuario fica inativo por
+    30s - eliminando repaints a 60 FPS e o transporte SharedMemory continuo que
     dispara o consumo de CPU do ``WebKitWebProcess`` + GTK main loop.
 
-    Inclui ainda o subsistema de reconexão ao backend (TICKET-DESKTOP-11):
+    Inclui ainda o subsistema de reconexao ao backend (TICKET-DESKTOP-11):
     heartbeat leve a cada 5s contra ``/api/system/info`` (fallback ``/health``)
-    detectando offline -> online e renovação de instância do daemon, com
+    detectando offline -> online e renovacao de instancia do daemon, com
     evento ``openchamber:backend-reconnected``, descarte de EventSource/
-    WebSocket órfãos e recarga controlada com cooldown anti-loop de 10s.
+    WebSocket orfaos e recarga controlada com cooldown anti-loop de 10s.
+
+    Regressao JS multibyte (TICKET-DESKTOP-06..11): o payload retornado por esta
+    funcao e mantido estritamente ASCII, de modo que
+    ``len(js) == len(js.encode('utf-8'))``. CAUSA RAIZ historica: em
+    ``webview/platforms/gtk.py`` o ``BrowserView.evaluate_js`` repassava
+    ``length=len(script)`` - CODE POINTS do Python - para
+    ``webkit_web_view_evaluate_javascript``, cuja API C interpreta o parametro
+    como BYTES UTF-8. Os comentarios acentuados dos tickets 10/11 somavam 64
+    caracteres nao-ASCII (64 bytes excedentes): o comprimento informado ficava
+    64 bytes curto, o WebKit truncava o script e abortava com
+    ``SyntaxError: Unexpected end of script`` - nenhum listener (paste Ctrl+V,
+    throttle de idle, reconexao) era instalado.
+    Defesa em profundidade em
+    :func:`_desktop_js_eval_length` + :func:`install_evaluate_js_length_patch`.
+
+    Exemplo:
+        >>> js = get_desktop_handlers_js()
+        >>> isinstance(js, str)
+        True
+        >>> len(js) > 0
+        True
     """
     return """
         if (!window.__desktop_handlers_installed) {
@@ -556,16 +697,16 @@ def get_desktop_handlers_js() -> str:
             }, true);
 
             // =====================================================================
-            // TICKET-DESKTOP-10 — Contenção de repaints em idle/desfocada/minimizada
-            // Pausa animações CSS contínuas (spinners, cursores, pulsos) para cortar
-            // os repaints a 60 FPS que mantêm WebKitWebProcess + GTK em CPU alta.
+            // TICKET-DESKTOP-10 - Contencao de repaints em idle/desfocada/minimizada
+            // Pausa animacoes CSS continuas (spinners, cursores, pulsos) para cortar
+            // os repaints a 60 FPS que mantem WebKitWebProcess + GTK em CPU alta.
             // =====================================================================
             if (!window.__desktop_idle_throttle_installed) {
                 window.__desktop_idle_throttle_installed = true;
                 (function() {
                     'use strict';
-                    // Estado idempotente: razões independentes (blur/oculto vs inatividade)
-                    // para que a liberação de uma não desfaça a outra.
+                    // Estado idempotente: razoes independentes (blur/oculto vs inatividade)
+                    // para que a liberacao de uma nao desfaca a outra.
                     window.__desktop_idle_active = false;
                     window.__desktop_idle_reasons = { blur: false, idle: false };
                     window.__desktop_idle_timer = null;
@@ -574,7 +715,7 @@ def get_desktop_handlers_js() -> str:
                     window.__desktop_idle_activity_throttle_ms = 250;
                     window.__desktop_idle_style_el = null;
 
-                    // a) Regra CSS dinâmica: pausa global de animações sob a classe raiz.
+                    // a) Regra CSS dinamica: pausa global de animacoes sob a classe raiz.
                     var ensureIdleStyle = function() {
                         try {
                             if (window.__desktop_idle_style_el && window.__desktop_idle_style_el.parentNode) {
@@ -598,7 +739,7 @@ def get_desktop_handlers_js() -> str:
                         }
                     };
 
-                    // Aplica/remove a contenção de forma idempotente e fail-soft.
+                    // Aplica/remove a contencao de forma idempotente e fail-soft.
                     var syncIdleState = function() {
                         try {
                             var reasons = window.__desktop_idle_reasons;
@@ -629,7 +770,7 @@ def get_desktop_handlers_js() -> str:
                         } catch (_) {}
                     };
 
-                    // Watchdog de inatividade: ativa a contenção após 30s sem interação.
+                    // Watchdog de inatividade: ativa a contencao apos 30s sem interacao.
                     var scheduleIdleWatchdog = function() {
                         try {
                             if (window.__desktop_idle_timer) {
@@ -642,7 +783,7 @@ def get_desktop_handlers_js() -> str:
                         } catch (_) {}
                     };
 
-                    // Atividade do usuário: libera a contenção de idle instantaneamente
+                    // Atividade do usuario: libera a contencao de idle instantaneamente
                     // e reagenda o watchdog (throttled para mousemove/wheel de alta taxa).
                     var noteActivity = function(immediate) {
                         try {
@@ -658,7 +799,7 @@ def get_desktop_handlers_js() -> str:
                         } catch (_) {}
                     };
 
-                    // c) Listeners de atividade do usuário (throttled).
+                    // c) Listeners de atividade do usuario (throttled).
                     var activityEvents = ['mousemove', 'wheel', 'mousedown', 'touchstart'];
                     for (var i = 0; i < activityEvents.length; i++) {
                         (function(evt) {
@@ -676,7 +817,7 @@ def get_desktop_handlers_js() -> str:
                     } catch (_) {}
 
                     // b) Eventos de janela / visibilidade: blur e oculto contenem
-                    // imediatamente; focus e visível removem a contenção imediatamente.
+                    // imediatamente; focus e visivel removem a contencao imediatamente.
                     try {
                         window.addEventListener('blur', function() {
                             setReason('blur', true);
@@ -698,7 +839,7 @@ def get_desktop_handlers_js() -> str:
                         }, true);
                     } catch (_) {}
 
-                    // Armadura inicial: inicia o watchdog (ainda sem contenção ativa).
+                    // Armadura inicial: inicia o watchdog (ainda sem contencao ativa).
                     try {
                         ensureIdleStyle();
                         scheduleIdleWatchdog();
@@ -707,13 +848,13 @@ def get_desktop_handlers_js() -> str:
             }
 
             // =====================================================================
-            // TICKET-DESKTOP-11 — Reconexão ao backend + reciclagem de streams
+            // TICKET-DESKTOP-11 - Reconexao ao backend + reciclagem de streams
             // Heartbeat leve (5s) contra /api/system/info com fallback /health:
-            // detecta queda -> retorno do daemon e renovação de instância
+            // detecta queda -> retorno do daemon e renovacao de instancia
             // (server_instance_id / pid), dispara openchamber:backend-reconnected,
-            // descarta EventSource/WebSocket órfãos e força reload limpo (GC da
-            // árvore React/JavaScriptCore) com cooldown anti-loop de 10s persistido
-            // em sessionStorage — o cooldown sobrevive ao próprio location.reload()
+            // descarta EventSource/WebSocket orfaos e forca reload limpo (GC da
+            // arvore React/JavaScriptCore) com cooldown anti-loop de 10s persistido
+            // em sessionStorage - o cooldown sobrevive ao proprio location.reload()
             // e blinda contra loops de reload a cada boot do backend.
             // =====================================================================
             if (!window.__desktop_reconnect_installed) {
@@ -721,8 +862,8 @@ def get_desktop_handlers_js() -> str:
                 (function() {
                     'use strict';
 
-                    // Parâmetros seguros por padrão; o frontend pode sobrescrevê-los
-                    // via window.__desktop_reconnect_config antes desta injeção.
+                    // Parametros seguros por padrao; o frontend pode sobrescreve-los
+                    // via window.__desktop_reconnect_config antes desta injecao.
                     var RECONNECT_POLL_MS = 5000;
                     var RECONNECT_FETCH_TIMEOUT_MS = 4000;
                     var RECONNECT_LONG_OFFLINE_MS = 4000;
@@ -817,7 +958,7 @@ def get_desktop_handlers_js() -> str:
 
                     // Descarte preventivo de streams pendentes: fecha EventSource e
                     // WebSocket registrados em window.__openchamber_streams (array ou
-                    // mapa) e nas globais residuais de conexões de turnos anteriores.
+                    // mapa) e nas globais residuais de conexoes de turnos anteriores.
                     var discardPendingStreams = function() {
                         var closed = 0;
                         try {
@@ -852,9 +993,9 @@ def get_desktop_handlers_js() -> str:
                         return closed;
                     };
 
-                    // Recarga controlada: somente após reinício completo confirmado
-                    // (mudança de instância + queda prolongada) ou após acúmulo de
-                    // reinícios, e sempre respeitando o cooldown anti-loop de 10s.
+                    // Recarga controlada: somente apos reinicio completo confirmado
+                    // (mudanca de instancia + queda prolongada) ou apos acumulo de
+                    // reinicios, e sempre respeitando o cooldown anti-loop de 10s.
                     var maybeReload = function(detail) {
                         try {
                             var cfg = readConfig();
@@ -878,7 +1019,7 @@ def get_desktop_handlers_js() -> str:
                         } catch (_) {}
                     };
 
-                    // Coordenada de reconexão: evento personalizado -> descarte de
+                    // Coordenada de reconexao: evento personalizado -> descarte de
                     // streams -> recarga controlada (ordem do TICKET-DESKTOP-11).
                     var handleReconnect = function(detail) {
                         try {
@@ -932,7 +1073,7 @@ def get_desktop_handlers_js() -> str:
                     };
 
                     // Heartbeat: tenta /api/system/info e cai para /health se falhar;
-                    // só marca offline quando TODOS os endpoints responderem mal.
+                    // so marca offline quando TODOS os endpoints responderem mal.
                     var probeBackend = function() {
                         var endpoints = RECONNECT_ENDPOINTS;
                         try {
@@ -976,7 +1117,7 @@ def get_desktop_handlers_js() -> str:
                                     .then(function(response) {
                                         clearTimeout(guard);
                                         if (!response || !response.ok) {
-                                            throw new Error('backend indisponível');
+                                            throw new Error('backend indisponivel');
                                         }
                                         return response.json().catch(function() { return {}; });
                                     })
@@ -999,8 +1140,8 @@ def get_desktop_handlers_js() -> str:
                         fetchEndpoint();
                     };
 
-                    // Loop de heartbeat fail-soft: tick fixo de 5s (ativo ou após
-                    // erro de rede), com guarda de idempotência de timer único.
+                    // Loop de heartbeat fail-soft: tick fixo de 5s (ativo ou apos
+                    // erro de rede), com guarda de idempotencia de timer unico.
                     var scheduleTick = function() {
                         try {
                             if (window.__desktop_reconnect_timer) {

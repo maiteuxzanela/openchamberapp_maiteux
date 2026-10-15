@@ -1449,6 +1449,325 @@ def test_desktop_handlers_js_reconnect_valid_javascript_syntax(tmp_path):
     assert result.returncode == 0, result.stderr
 
 
+# =====================================================================
+# 10. TICKET-DESKTOP-12 — Paridade de comprimento code points/bytes UTF-8
+#     no transporte WebKitGTK (regressão do truncamento do pywebview).
+#     Zero mocks: probes reais em memória, GLib.MainLoop real (sem display)
+#     e validação sintática pelo binário node do sistema.
+# =====================================================================
+
+def test_desktop_handlers_js_is_pure_ascii():
+    """O payload injetado é 100% ASCII: ``len(code points) == len(bytes UTF-8)``.
+
+    Causa raiz (TICKET-DESKTOP-12): ``BrowserView.evaluate_js`` do pywebview chama
+    ``webkit_web_view_evaluate_javascript(script, length=len(script), ...)``. O
+    ``length`` da API C é contado em BYTES UTF-8, enquanto ``len(script)`` é contado
+    em CODE POINTS; com acentuação (``ç ã õ í ê ó``, travessão ``—``) o WebKit lê
+    menos bytes do que o buffer real e trunca o script no meio de um caractere
+    multibyte — emitindo ``WebKitJavascriptError`` (SyntaxError) silencioso no boot.
+    Manter o payload ASCII elimina a divergência na origem.
+    """
+    js = get_desktop_handlers_js()
+    assert js.isascii(), "payload JS contém não-ASCII — sujeito ao truncamento do WebKitGTK"
+    assert len(js) == len(js.encode("utf-8"))
+
+
+def test_desktop_handlers_js_survives_pywebview_codepoint_truncation(tmp_path):
+    """Repro determinístico do defeito real: ``js.encode('utf-8')[:len(js)]``.
+
+    O pywebview (``platforms/gtk.py``) entrega ao WebKitGTK ``length=len(script)``
+    em code points; o WebKit, por sua vez, consome os primeiros ``length`` BYTES do
+    buffer UTF-8 — exatamente o slice ``js.encode('utf-8')[:len(js)]``. Antes do fix
+    (payload acentuado: 28613 code points vs 28677 bytes) esse slice perdia os 64
+    bytes finais e partia um caractere multibyte, reprovando no ``node --check``
+    (SyntaxError na região final do bloco do heartbeat). Com o payload ASCII o slice
+    coincide com o script inteiro e a sintaxe é válida. Este teste FALHA antes do fix
+    do app.py e PASSA depois.
+    """
+    node = shutil.which("node")
+    assert node is not None, "binário node ausente do PATH — validação sintática impossível"
+
+    js = get_desktop_handlers_js()
+    truncated_pywebview_path = js.encode("utf-8")[: len(js)]
+
+    probe = tmp_path / "desktop_handlers_pywebview_truncated.js"
+    probe.write_bytes(truncated_pywebview_path)
+
+    result = subprocess.run(
+        [node, "--check", str(probe)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, (
+        "o caminho real do pywebview (length=len(script) sobre UTF-8) truncou o payload "
+        f"injetado: {result.stderr}"
+    )
+
+
+class _EvalAsyncTaskResult:
+    """Token mínimo (GAsyncResult) aceito por ``evaluate_javascript_finish``."""
+
+
+class WebKitWebViewEvalProbe:
+    """Probe que modela o ``WebKitWebView`` mínimo consumido por ``evaluate_js``.
+
+    Mesmo espírito dos probes GObject desta suíte: registra o ``length`` e o
+    ``script`` realmente entregues a ``evaluate_javascript`` e invoca o callback de
+    conclusão de forma síncrona. Não é mock: é a fronteira nativa (WebKitGTK)
+    exercitada por um objeto real em memória, sem depender de display/X11.
+    """
+
+    def __init__(self, js_result: str = "null") -> None:
+        self.calls: typing.List[typing.Dict[str, typing.Any]] = []
+        self._js_result = js_result
+
+    def evaluate_javascript(self, script, length, world_name, source_uri, cancellable, callback):
+        """Captura os argumentos reais do transporte e conclui o callback."""
+        self.calls.append({"script": script, "length": length})
+        callback(self, _EvalAsyncTaskResult())
+
+    def evaluate_javascript_finish(self, task):
+        """Devolve o valor JS "convertido" pré-fixado pelo probe."""
+        return self._js_result
+
+
+class BrowserViewEvalProbe:
+    """Probe do ``BrowserView``: suprir ``webview`` e ``_convert_js_value`` reais."""
+
+    def __init__(self, js_result: str = "null") -> None:
+        self.webview = WebKitWebViewEvalProbe(js_result)
+
+    def _convert_js_value(self, value):
+        """Identidade: o valor já vem pronto do ``WebKitWebViewEvalProbe``."""
+        return value
+
+
+class GLibMainLoopThread:
+    """Roda o ``GLib.MainLoop`` real em thread daemon para acordar ``glib.idle_add``.
+
+    A ``_evaluate_js`` de ``evaluate_js`` é agendada por ``glib.idle_add`` e o
+    chamador bloqueia no ``Semaphore``. Sem display, o loop GLib genérico (que não
+    depende de X11/Wayland) é suficiente para despachar a fonte ociosa.
+    """
+
+    def __enter__(self):
+        self._loop = GLib.MainLoop()
+        self._thread = threading.Thread(target=self._loop.run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc):
+        self._loop.quit()
+        self._thread.join(timeout=5.0)
+
+
+def test_desktop_js_eval_length_seam_returns_webkit_nul_sentinel():
+    """O seam puro devolve o sentinela NUL-terminated (``-1``), não ``len(script)``."""
+    assert app_module._desktop_js_eval_length("") == -1
+    assert app_module._desktop_js_eval_length("abc") == -1
+
+    accented = "acentuação—çãõíêóú"
+    assert app_module._desktop_js_eval_length(accented) == -1
+    # Contraste explícito com o valor defeituoso (code points) do pywebview original.
+    assert app_module._desktop_js_eval_length(accented) != len(accented)
+
+
+def test_custom_evaluate_js_passes_nul_sentinel_and_preserves_contract():
+    """O monkeypatch entrega ``length=-1`` e preserva ``parse_json``/retorno reais.
+
+    Exercita ``app._custom_evaluate_js`` (já instalado como
+    ``BrowserView.evaluate_js``) contra um ``BrowserViewEvalProbe`` em memória, acordando
+    ``glib.idle_add`` por um ``GLib.MainLoop`` daemon — sem GTK/display.
+    """
+    unbound = app_module.gtk_plat.BrowserView.evaluate_js
+
+    # parse_json=False: valor convertido devolvido cru; length == -1; script íntegro.
+    probe = BrowserViewEvalProbe("valor-bruto")
+    with GLibMainLoopThread():
+        out = unbound(probe, "var x = 'á';", False)
+    assert out == "valor-bruto"
+    assert len(probe.webview.calls) == 1
+    assert probe.webview.calls[0]["length"] == -1
+    assert probe.webview.calls[0]["script"] == "var x = 'á';"
+
+    # parse_json=True: json.loads preservado sobre o valor convertido.
+    probe_json = BrowserViewEvalProbe('{"ok": true, "n": 3}')
+    with GLibMainLoopThread():
+        out_json = unbound(probe_json, "({ok: true})", True)
+    assert out_json == {"ok": True, "n": 3}
+    assert probe_json.webview.calls[0]["length"] == -1
+
+
+def test_custom_evaluate_js_source_uses_seam_not_codepoint_length():
+    """A fonte do patch usa o seam ``_desktop_js_eval_length``, não ``len(script)``."""
+    source = inspect.getsource(app_module._custom_evaluate_js)
+    assert "length=_desktop_js_eval_length(script)" in source
+    assert "length=len(script)" not in source
+    # Contrato de parse_json e retorno preservados do original do pywebview.
+    assert "if parse_json and res:" in source
+    assert "return result" in source
+
+
+def test_install_evaluate_js_length_patch_is_idempotent_and_fail_soft():
+    """O instalador é fail-soft/idempotente e deixa o patch ativo já no import."""
+    installer_source = inspect.getsource(app_module.install_evaluate_js_length_patch)
+    assert "BrowserView.evaluate_js = _custom_evaluate_js" in installer_source
+    assert "except Exception" in installer_source  # fail-soft
+
+    # Ativo já no import do módulo (sem re-execução manual) e idempotente.
+    assert app_module.gtk_plat.BrowserView.evaluate_js is app_module._custom_evaluate_js
+    assert app_module.install_evaluate_js_length_patch() is True
+    assert app_module.gtk_plat.BrowserView.evaluate_js is app_module._custom_evaluate_js
+
+
+@pytest.mark.parametrize("sample", [
+    "reconexão",
+    "contenção de idle",
+    "travessão — multibyte",
+    "usuário café naïve",
+    "aceleração 🚀",
+])
+def test_utf8_byte_parity_guard_for_multibyte_samples(sample):
+    """Guard de paridade bytes: ``length`` do WebKitGTK é em BYTES, não code points.
+
+    Fixa a invariante que justifica o monkeypatch (``-1`` = string terminada em NUL):
+    para qualquer string multibyte ``len(code points) != len(bytes)``, logo usar
+    ``len(script)`` como ``length`` perderia bytes e exporia ``WebKitJavascriptError``.
+    A estratégia correta (``-1`` ou bytes integrais) preserva a carga completa.
+    Determinístico e sem GTK/display.
+    """
+    encoded = sample.encode("utf-8")
+    assert len(encoded) > len(sample), "amostra precisa ser multibyte"
+
+    # Caminho defeituoso do pywebview: slice em code points sobre o buffer UTF-8.
+    codepoint_slice = encoded[: len(sample)]
+    assert codepoint_slice != encoded, "o caminho defectivo deve truncar a carga"
+    assert len(codepoint_slice) < len(encoded)
+
+    # Estratégia correta (bytes integrais / NUL-terminated): carga completa preservada.
+    assert encoded[: len(encoded)] == encoded
+
+
+# =====================================================================
+# 11. T2 — Robustez do transporte evaluate_js: timeout defensivo do
+#     Semaphore (acquire(timeout=5.0)) e caminhos reais de exceção
+#     validados com pytest.raises. Zero mocks: probes reais em memória e
+#     GLib.MainLoop real (sem display/X11).
+# =====================================================================
+
+class WebKitWebViewSilentProbe:
+    """Probe do ``WebKitWebView`` que NUNCA conclui o ``callback`` do WebKit.
+
+    Modela o cenário real de robustez em que o WebKitGTK aceita
+    ``evaluate_javascript`` mas jamais dispara o callback de conclusão
+    (renderer travado/morto, evento perdido). Não é mock: é a fronteira nativa
+    exposta por um objeto real em memória; o ``Semaphore`` de
+    ``app._custom_evaluate_js`` nunca é liberado.
+    """
+
+    def __init__(self) -> None:
+        self.calls: typing.List[typing.Dict[str, typing.Any]] = []
+
+    def evaluate_javascript(self, script, length, world_name, source_uri, cancellable, callback):
+        """Registra o transporte real e retorna SEM invocar ``callback``."""
+        self.calls.append({"script": script, "length": length})
+        # Intencionalmente NÃO invoca callback: reproduz o WebKit mudo.
+
+
+class BrowserViewSilentProbe:
+    """Probe do ``BrowserView`` emparelhado ao ``WebKitWebViewSilentProbe``."""
+
+    def __init__(self) -> None:
+        self.webview = WebKitWebViewSilentProbe()
+
+    def _convert_js_value(self, value):
+        return value
+
+
+def test_custom_evaluate_js_timeout_returns_none_without_hanging(caplog):
+    """O ``acquire(timeout=5.0)`` devolve ``None`` e NÃO trava quando o WebKit silencia.
+
+    Repro real do defeito de robustez (TICKET-DESKTOP-robustez): antes do fix o
+    ``result_semaphore.acquire()`` sem timeout bloqueava a thread da chamada PARA
+    SEMPRE se o callback de conclusão do WebKit nunca chegasse. Com a guarda, o
+    idle ainda despacha ``evaluate_javascript`` (loop GLib real), mas a ausência
+    de callback expira o semáforo em ~5s e a função devolve ``None`` dentro de um
+    limite temporal estrito, emitindo ``logger.warning``.
+    """
+    unbound = app_module.gtk_plat.BrowserView.evaluate_js
+    probe = BrowserViewSilentProbe()
+
+    caplog.set_level("WARNING", logger="openchamber.desktop")
+    with GLibMainLoopThread():
+        start = time.monotonic()
+        out = unbound(probe, "var x = 1;", False)
+        elapsed = time.monotonic() - start
+
+    # Não trava: retorna (None) dentro de uma janela temporal estrita.
+    assert out is None
+    assert elapsed >= 4.5, f"o caminho de timeout nem foi exercitado ({elapsed:.2f}s)"
+    assert elapsed < 20.0, f"a chamada travou além do timeout defensivo ({elapsed:.2f}s)"
+
+    # O idle real despachou o transporte (length=-1 preservado), sem consumir callback.
+    assert len(probe.webview.calls) == 1
+    assert probe.webview.calls[0]["length"] == -1
+    assert probe.webview.calls[0]["script"] == "var x = 1;"
+
+    # O ramo de timeout emite o aviso dedicado (observabilidade fail-soft).
+    assert any(
+        "Timeout aguardando execucao de evaluate_js" in record.getMessage()
+        for record in caplog.records
+        if record.name == "openchamber.desktop"
+    ), "o ramo de timeout deve emitir logger.warning"
+
+
+def test_custom_evaluate_js_source_guards_acquire_with_timeout():
+    """A fonte do patch protege o ``acquire`` com timeout e fallback fail-soft (None)."""
+    source = inspect.getsource(app_module._custom_evaluate_js)
+    assert "if not result_semaphore.acquire(timeout=5.0):" in source
+    # Sem retorno ao bloqueio indefinido (acquire sem argumento/limite).
+    assert "result_semaphore.acquire()" not in source
+    assert "logger.warning" in source
+    # O fallback não levanta: devolve o ``result`` default (None).
+    assert "return result" in source
+
+
+def test_resolve_debug_mode_invalid_mapping_raises_attribute_error():
+    """Parâmetro fora do contrato ``Mapping`` deve falhar alto (fail-fast), não silenciar.
+
+    ``resolve_debug_mode`` consulta ``source.get(...)``; um contêiner sem ``.get``
+    (ex.: ``list``) viola a assinatura tipada e levanta ``AttributeError``.
+    """
+    with pytest.raises(AttributeError):
+        app_module.resolve_debug_mode(env=[])
+
+
+def test_browser_spawn_suppressed_invalid_env_raises_attribute_error():
+    """``browser_spawn_suppressed`` exige um ``Mapping``; env inválido levanta ``AttributeError``."""
+    with pytest.raises(AttributeError):
+        app_module.browser_spawn_suppressed(env=[], modules={})
+
+
+def test_shortcut_handler_requires_real_event_key():
+    """O handler de atalhos assume ``Gdk.EventKey``; um evento sem ``keyval`` levanta."""
+    handler = app_module.create_shortcut_handler(object())
+    with pytest.raises(AttributeError):
+        handler(object(), object())
+
+
+def test_shortcut_handler_rejects_wrong_typed_modifier_state():
+    """``event.state`` não inteiro quebra a máscara de modificadores (``TypeError``)."""
+    handler = app_module.create_shortcut_handler(object())
+
+    class _WrongTypedEvent:
+        keyval = Gdk.KEY_a
+        state = "not-an-int"
+
+    with pytest.raises(TypeError):
+        handler(object(), _WrongTypedEvent())
+
+
 def test_ticket11_production_and_tests_are_free_of_mocks():
     """Anti-mock: nem o app.py (produção) nem esta suíte importam bibliotecas de mock."""
     mock_tokens = (
